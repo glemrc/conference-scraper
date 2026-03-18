@@ -1,0 +1,8 @@
+.env
+*.env
+__pycache__/
+*.pyc
+~$*.xlsx
+scraper_cache.json
+reporte_conferencias_v2.xlsx
+*.xlsx
