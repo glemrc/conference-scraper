@@ -4,15 +4,26 @@ scraper_v2.py
 Conference Deadline Monitoring System — v2 (modular, optimized).
 
 Pipeline per URL:
-  1. Download HTML
+  1. Download HTML (static)
   2. Smart-extract date-relevant text  (text_extractor)
-  3. Hash and compare with cache        (cache_manager)
-     → unchanged? return cached dates, skip everything else
-  4. Try regex extraction               (regex_extractor)
+  3. [F1] If text is thin/empty AND page looks JS-rendered → retry with
+     headless browser (js_renderer)
+  4. Hash and compare with cache        (cache_manager)
+     → unchanged AND valid cache? return cached dates, skip everything else
+  5. Try regex extraction               (regex_extractor)
      → high confidence? use regex results, skip LLM
-  5. LLM fallback (Groq API)            only for missing fields
-  6. Compare with existing database     (change_detector)
-  7. Update cache
+  6. LLM fallback (Groq API)            only for missing fields
+  7. Compare with existing database     (change_detector)
+  8. Update cache
+
+Changes vs original:
+  F1 — JS rendering: js_renderer imported; descargar_html_completo() added
+       as a two-phase downloader (static → JS fallback when needed).
+  F3 — Cache gate: split into has_changed() AND has_valid_cache(); invalid
+       entries no longer short-circuit extraction.
+  F5 — max_tokens raised to 1024; _parse_llm_json() now repairs incomplete
+       JSON before raising JSONDecodeError.
+  F6 — cargar_urls() deduplicates while preserving order.
 
 Output: Excel workbook with two sheets
   Sheet 1 — "Extracted Data"   : full table of all conferences
@@ -25,6 +36,8 @@ Usage:
 
 Requires:
     pip install requests beautifulsoup4 pandas openpyxl python-dateutil groq python-dotenv
+Optional (for JS-rendered pages):
+    pip install playwright && playwright install chromium --with-deps
 """
 
 import json
@@ -56,13 +69,17 @@ from change_detector import (
     detect_changes, load_db_dates, ChangeReport,
 )
 
+# F1: JS renderer (optional — gracefully absent if playwright not installed)
+try:
+    from js_renderer import is_js_rendered_page, render_with_js
+    _JS_RENDERER_AVAILABLE = True
+except ImportError:
+    _JS_RENDERER_AVAILABLE = False
+
 # ─────────────────────────────────────────────
-# Load .env (if present) so GROQ_API_KEY is available
+# Load .env
 # ─────────────────────────────────────────────
 load_dotenv()
-
-# Re-read after dotenv (config.py reads os.getenv at import time,
-# but .env might not have been loaded yet)
 _GROQ_KEY = os.getenv("GROQ_API_KEY", "") or GROQ_API_KEY
 
 # ─────────────────────────────────────────────
@@ -78,42 +95,60 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # Fixed URL list (fallback)
 # ─────────────────────────────────────────────
-URLS_FIJAS =[
-"https://icacit.org.pe/symposium/important-dates/",
-"https://comesyso.openpublish.eu/article/download",
-"https://eeeu25.gjem.press",
-"https://scrs.in/conference/csct2025",
-"https://www.scrs.in/conference/csct2025",
-"https://worldcist.org",
-"https://seeu2026.gjem.press",
-"https://acdsa.org/2026/deadlines",
-"https://scrs.in/conference/icitai2026",
-"https://scrs.in/conference/cml2026",
-"https://scrs.in/conference/cvr2026",
-"https://scrs.in/conference/bida2026",
-"https://laccei.org/laccei2026/call-for-papers/",
-"https://congresotaee.es/en/en-home/",
-"https://csoc.openpublish.eu",
-"https://icoamp.com/index.htm",
-"https://www.gkciet.ac.in/peis2026",
-"https://pacis2026.aisconferences.org",
-"https://theioes.org/air2026/index.php",
-"https://stai2026.estindiafoundation.org/",
-"https://scrs.in/conference/icivc2026",
-"https://scrs.in/conference/CIMA2026",
-"https://scrs.in/conference/icdsa2026",
-"https://www.icet.org",
-"https://scrs.in/conference/aic2026",
-"https://comesyso.openpublish.eu/article/download",
-"https://ieee-uemcon.org",
-"https://www.scrs.in/conference/ceee2026",
-"https://icdici.com/2026/"
+URLS_FIJAS = [
+    "https://icacit.org.pe/symposium/important-dates/",
+    "https://comesyso.openpublish.eu/article/download",
+    "https://eeeu25.gjem.press",
+    "https://scrs.in/conference/csct2025",
+    "https://www.scrs.in/conference/csct2025",
+    "https://worldcist.org",
+    "https://seeu2026.gjem.press",
+    "https://acdsa.org/2026/deadlines",
+    "https://scrs.in/conference/icitai2026",
+    "https://scrs.in/conference/cml2026",
+    "https://scrs.in/conference/cvr2026",
+    "https://scrs.in/conference/bida2026",
+    "https://laccei.org/laccei2026/call-for-papers/",
+    "https://congresotaee.es/en/en-home/",
+    "https://csoc.openpublish.eu",
+    "https://icoamp.com/index.htm",
+    "https://www.gkciet.ac.in/peis2026",
+    "https://pacis2026.aisconferences.org",
+    "https://theioes.org/air2026/index.php",
+    "https://stai2026.estindiafoundation.org/",
+    "https://scrs.in/conference/icivc2026",
+    "https://scrs.in/conference/CIMA2026",
+    "https://scrs.in/conference/icdsa2026",
+    "https://www.icet.org",
+    "https://scrs.in/conference/aic2026",
+    "https://ieee-uemcon.org",
+    "https://www.scrs.in/conference/ceee2026",
+    "https://icdici.com/2026/",
 ]
 
 
 # ═════════════════════════════════════════════
 #  URL LOADING
 # ═════════════════════════════════════════════
+
+def _dedup_urls(urls: list[str]) -> list[str]:
+    """
+    F6 fix: remove duplicate URLs while preserving order.
+    Normalises trailing slashes before comparison so that
+    "https://example.com" and "https://example.com/" are treated as one.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for url in urls:
+        key = url.rstrip("/").lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(url)
+    removed = len(urls) - len(result)
+    if removed:
+        log.info("Removed %d duplicate URL(s).", removed)
+    return result
+
 
 def cargar_urls(fuente: str | None = None) -> list[str]:
     """Load URLs from CSV/Excel file, the database, or the fixed list."""
@@ -129,11 +164,10 @@ def cargar_urls(fuente: str | None = None) -> list[str]:
                 )
                 urls = df[col].dropna().str.strip().tolist()
                 log.info("Loaded %d URLs from '%s'.", len(urls), fuente)
-                return urls
+                return _dedup_urls(urls)
             except Exception as exc:
                 log.error("Error reading '%s': %s. Falling back.", fuente, exc)
 
-    # Try loading from the existing database
     if DB_FILE.exists():
         try:
             df = pd.read_excel(DB_FILE, engine="openpyxl")
@@ -145,20 +179,20 @@ def cargar_urls(fuente: str | None = None) -> list[str]:
                 if urls:
                     log.info("Loaded %d URLs from database '%s'.",
                              len(urls), DB_FILE.name)
-                    return urls
+                    return _dedup_urls(urls)
         except Exception:
             pass
 
     log.info("Using fixed URL list (%d URLs).", len(URLS_FIJAS))
-    return list(URLS_FIJAS)
+    return _dedup_urls(list(URLS_FIJAS))
 
 
 # ═════════════════════════════════════════════
-#  HTML DOWNLOAD
+#  HTML DOWNLOAD (static + JS fallback)
 # ═════════════════════════════════════════════
 
-def descargar_html(url: str) -> str | None:
-    """Download HTML from a URL. Returns None on error."""
+def _static_download(url: str) -> str | None:
+    """Download HTML via requests (no JS execution)."""
     try:
         resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
@@ -174,8 +208,48 @@ def descargar_html(url: str) -> str | None:
     return None
 
 
+def descargar_html(url: str) -> tuple[str | None, bool]:
+    """
+    F1 fix: two-phase HTML acquisition.
+
+    Phase 1 — static download via requests (fast, no browser overhead).
+    Phase 2 — JS rendering via Playwright, triggered only when:
+               a) playwright is installed, AND
+               b) the static HTML appears to be a JS-rendered shell
+                  (detected by is_js_rendered_page()).
+
+    Returns
+    -------
+    html      : the HTML string, or None on total failure
+    used_js   : True if the JS renderer was used
+    """
+    html = _static_download(url)
+    if html is None:
+        return None, False
+
+    if not _JS_RENDERER_AVAILABLE:
+        return html, False
+
+    # Quick pre-check: extract date text from the static HTML to test quality
+    try:
+        from text_extractor import extract_date_text as _edt
+        preview_text = _edt(html)
+    except Exception:
+        preview_text = ""
+
+    if is_js_rendered_page(html, preview_text):
+        log.info("  [F1] JS-rendered page detected — switching to headless browser.")
+        js_html = render_with_js(url)
+        if js_html:
+            return js_html, True
+        else:
+            log.warning("  [F1] JS rendering failed — using static HTML as fallback.")
+
+    return html, False
+
+
 # ═════════════════════════════════════════════
-#  GROQ LLM (minimal-call layer)
+#  GROQ LLM
 # ═════════════════════════════════════════════
 
 _groq_client: Groq | None = None
@@ -195,8 +269,6 @@ def _get_groq_client() -> Groq:
     return _groq_client
 
 
-# ── Prompt for full extraction ──────────────────────────────────────
-
 _FULL_PROMPT = """\
 Extract conference dates from this text. Normalize ALL dates to YYYY-MM-DD.
 Use null for missing information.
@@ -215,8 +287,6 @@ Text:
 ---
 {text}
 ---"""
-
-# ── Prompt for partial extraction (only missing fields) ─────────────
 
 _PARTIAL_PROMPT = """\
 I already extracted some dates from a conference page. I need you to find
@@ -258,7 +328,11 @@ def _call_llm(prompt: str) -> str | None:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                max_tokens=512,
+                # F5 fix: raised from 512 to 1024.
+                # The original 512 was enough for a clean 6-field JSON only
+                # if the model used minimal spacing.  With topics and longer
+                # date strings the response could be silently truncated.
+                max_tokens=1024,
             )
             resp = completion.choices[0].message.content
             log.info("  [LLM] Response received (%d chars).", len(resp))
@@ -277,6 +351,43 @@ def _call_llm(prompt: str) -> str | None:
     return None
 
 
+def _repair_truncated_json(json_str: str) -> str:
+    """
+    F5 fix: attempt to close an incomplete JSON object that was cut off
+    by a token limit.  Handles the most common case: missing closing brace
+    after the last key-value pair.
+
+    This is a best-effort repair — it only handles simple truncations, not
+    deeply nested structures.
+    """
+    s = json_str.strip()
+    if s.endswith("}"):
+        return s  # already complete
+
+    # Count open vs closed braces
+    open_b  = s.count("{")
+    close_b = s.count("}")
+    deficit = open_b - close_b
+    if deficit <= 0:
+        return s  # nothing obvious to fix
+
+    # If the last value is an incomplete string, close it first
+    if s.count('"') % 2 != 0:
+        s += '"'
+
+    # Close any open list
+    open_sq  = s.count("[")
+    close_sq = s.count("]")
+    if open_sq > close_sq:
+        s += "]" * (open_sq - close_sq)
+
+    # Close open objects
+    s += "}" * deficit
+
+    log.debug("  [LLM] Repaired truncated JSON (added %d closing brace(s)).", deficit)
+    return s
+
+
 def _parse_llm_json(raw: str | None) -> dict:
     """Parse raw LLM response into a dict."""
     from dateutil import parser as dateutil_parser
@@ -292,12 +403,21 @@ def _parse_llm_json(raw: str | None) -> dict:
     obj_match = re.search(r"\{[\s\S]*\}", json_str)
     if obj_match:
         json_str = obj_match.group(0)
+    else:
+        log.error("  No JSON object found in LLM response: %.200s", raw)
+        return {}
 
+    # F5 fix: attempt repair before giving up
     try:
         data = json.loads(json_str)
-    except json.JSONDecodeError as exc:
-        log.error("  Invalid JSON from LLM: %s | %.200s", exc, raw)
-        return {}
+    except json.JSONDecodeError:
+        json_str = _repair_truncated_json(json_str)
+        try:
+            data = json.loads(json_str)
+            log.info("  [LLM] Successfully parsed repaired JSON.")
+        except json.JSONDecodeError as exc:
+            log.error("  Invalid JSON from LLM (even after repair): %s | %.200s", exc, raw)
+            return {}
 
     # Normalize date values
     result = {}
@@ -354,13 +474,11 @@ def llm_partial_extraction(text: str, found: dict) -> dict:
     raw = _call_llm(prompt)
     llm_result = _parse_llm_json(raw)
 
-    # Merge: keep regex results, fill gaps from LLM
     merged = dict(found)
     for k in missing:
         if llm_result.get(k):
             merged[k] = llm_result[k]
 
-    # Merge topics
     if "temas" not in merged or not merged.get("temas"):
         merged["temas"] = llm_result.get("temas", [])
 
@@ -383,16 +501,18 @@ def procesar_url(
     -------
     record : dict   — extracted data
     changes : list  — list of Change objects
-    method : str    — "cache" | "regex" | "regex+llm" | "llm"
+    method : str    — "cache" | "regex" | "regex+llm" | "llm" | "js+..." | "error"
     """
     log.info("Processing: %s", url)
     empty = {k: None for k in DATE_KEYS}
     empty["temas"] = []
 
-    # ── Step 1: Download HTML ──
-    html = descargar_html(url)
+    # ── Step 1: Download HTML (static + optional JS fallback) ──
+    html, used_js = descargar_html(url)
     if not html:
         return {"url": url, **empty}, [], "error"
+
+    js_prefix = "js+" if used_js else ""
 
     # ── Step 2: Smart text extraction ──
     try:
@@ -405,29 +525,41 @@ def procesar_url(
         log.error("  Text extraction error: %s", exc)
         return {"url": url, **empty}, [], "error"
 
-    # ── Step 3: Cache check ──
-    if not cache.has_changed(url, date_text):
-        log.info("  ✅ Content unchanged — using cached dates.")
+    # ── Step 3: Cache check (F3 fix) ──
+    # Skip extraction only when BOTH conditions hold:
+    #   a) content hash is unchanged
+    #   b) the cached result was previously valid (has at least one date)
+    content_unchanged = not cache.has_changed(url, date_text)
+    has_valid = cache.has_valid_cache(url)
+
+    if content_unchanged and has_valid:
+        log.info("  ✅ Content unchanged, valid cache — skipping extraction.")
         cached = cache.get_cached_dates(url)
+        # get_cached_dates() now returns None for invalid entries, so this
+        # check is belt-and-suspenders but does not hurt.
         if cached:
             cached["temas"] = cache.get_cached_topics(url)
             return {"url": url, **cached}, [], "cache"
+    elif content_unchanged and not has_valid:
+        log.info(
+            "  ⚠️  Content unchanged but previous result was invalid — re-extracting."
+        )
 
     # ── Step 4: Regex extraction ──
     regex_dates, confidence = extract_with_regex(date_text)
-    method = "regex"
+    method = f"{js_prefix}regex"
 
-    # ── Step 5: Decide LLM usage based on confidence ──
+    # ── Step 5: LLM decision based on confidence ──
     if confidence >= REGEX_CONFIDENCE_HIGH:
         log.info("  ✅ Regex confidence %.0f%% — skipping LLM.", confidence * 100)
         dates = regex_dates
         dates["temas"] = []
-        method = "regex"
+        method = f"{js_prefix}regex"
     elif confidence >= REGEX_CONFIDENCE_PARTIAL:
         log.info("  ⚡ Regex confidence %.0f%% — partial LLM call.", confidence * 100)
         try:
             dates = llm_partial_extraction(date_text, regex_dates)
-            method = "regex+llm"
+            method = f"{js_prefix}regex+llm"
         except ValueError as exc:
             log.error("  %s", exc)
             dates = regex_dates
@@ -439,13 +571,14 @@ def procesar_url(
             if not dates:
                 dates = {k: None for k in DATE_KEYS}
                 dates["temas"] = []
-            method = "llm"
+            method = f"{js_prefix}llm"
         except ValueError as exc:
             log.error("  %s", exc)
             dates = regex_dates
             dates.setdefault("temas", [])
 
     # ── Step 6: Update cache ──
+    # is_valid is inferred inside CacheManager.update() from dates values.
     cache.update(
         url, date_text,
         {k: dates.get(k) for k in DATE_KEYS},
@@ -479,11 +612,9 @@ def write_excel_report(
     """Write the two-sheet Excel report."""
     path = output_path or OUTPUT_FILE
 
-    # ── Sheet 1: Extracted Data ──
     col_order = ["url"] + DATE_KEYS + ["temas", "extraction_method"]
     df_data = pd.DataFrame(records)
 
-    # Ensure all columns exist
     for col in col_order:
         if col not in df_data.columns:
             df_data[col] = None
@@ -493,19 +624,14 @@ def write_excel_report(
         lambda t: " | ".join(t) if isinstance(t, list) else str(t) if t else ""
     )
 
-    # Rename columns for readability
     df_data = df_data.rename(columns=COLUMN_LABELS)
-
-    # ── Sheet 2: Detected Changes ──
     df_changes = change_report.to_dataframe()
 
-    # ── Write ──
     try:
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             df_data.to_excel(writer, sheet_name="Extracted Data", index=False)
             df_changes.to_excel(writer, sheet_name="Detected Changes", index=False)
 
-            # Auto-size columns for readability
             for sheet_name in ["Extracted Data", "Detected Changes"]:
                 ws = writer.sheets[sheet_name]
                 for col_cells in ws.columns:
@@ -536,13 +662,11 @@ def main(fuente_urls: str | None = None):
         log.error("No URLs to process.")
         return
 
-    # Initialize components
     cache = CacheManager()
     db_dates = load_db_dates()
     change_report = ChangeReport()
 
-    # Stats
-    stats = {"cache": 0, "regex": 0, "regex+llm": 0, "llm": 0, "error": 0}
+    stats: dict[str, int] = {}
 
     records = []
     for i, url in enumerate(urls, 1):
@@ -559,24 +683,33 @@ def main(fuente_urls: str | None = None):
         if i < len(urls):
             time.sleep(DELAY_BETWEEN_REQUESTS)
 
-    # Save cache
     cache.save()
-
-    # Write report
     write_excel_report(records, change_report)
 
-    # Print summary
+    # ── Summary ──
+    total_cache  = sum(v for k, v in stats.items() if k == "cache")
+    total_regex  = sum(v for k, v in stats.items() if "regex" in k and "llm" not in k)
+    total_rllm   = sum(v for k, v in stats.items() if "regex+llm" in k)
+    total_llm    = sum(v for k, v in stats.items() if k in ("llm", "js+llm"))
+    total_js     = sum(v for k, v in stats.items() if k.startswith("js+"))
+    total_errors = stats.get("error", 0)
+
     print(f"\n{'═' * 60}")
     print("  📊 RUN SUMMARY")
     print(f"{'═' * 60}")
-    print(f"  Total conferences: {len(records)}")
-    print(f"  Cache hits (no LLM):  {stats['cache']}")
-    print(f"  Regex only (no LLM): {stats['regex']}")
-    print(f"  Regex + partial LLM: {stats['regex+llm']}")
-    print(f"  Full LLM calls:      {stats['llm']}")
-    print(f"  Errors:              {stats['error']}")
-    print(f"  LLM calls saved:     {stats['cache'] + stats['regex']}"
-          f" / {len(records)}")
+    print(f"  Total conferences : {len(records)}")
+    print(f"  Cache hits        : {total_cache}")
+    print(f"  Regex only        : {total_regex}")
+    print(f"  Regex + partial LLM: {total_rllm}")
+    print(f"  Full LLM calls    : {total_llm}")
+    print(f"  JS rendering used : {total_js}")
+    print(f"  Errors            : {total_errors}")
+    print(f"  LLM calls saved   : {total_cache + total_regex} / {len(records)}")
+    if not _JS_RENDERER_AVAILABLE:
+        print(
+            "\n  ℹ️  JS rendering unavailable (playwright not installed).\n"
+            "     To enable: pip install playwright && playwright install chromium --with-deps"
+        )
     print()
 
     if change_report.has_changes:
