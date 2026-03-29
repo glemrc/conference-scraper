@@ -6,3 +6,4 @@ __pycache__/
 scraper_cache.json
 reporte_conferencias_v2.xlsx
 *.xlsx
+.claude

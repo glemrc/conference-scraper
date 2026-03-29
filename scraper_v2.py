@@ -45,6 +45,7 @@ import os
 import re
 import sys
 import time
+from datetime import date as date_type, datetime
 import logging
 from pathlib import Path
 
@@ -58,9 +59,10 @@ from config import (
     GROQ_API_KEY, GROQ_MODEL,
     OUTPUT_FILE, DB_FILE,
     REQUEST_TIMEOUT, DELAY_BETWEEN_REQUESTS,
-    MAX_TEXT_CHARS,
+    MAX_TEXT_CHARS, MAX_SMART_TEXT_CHARS,
     REGEX_CONFIDENCE_HIGH, REGEX_CONFIDENCE_PARTIAL,
     DATE_KEYS, COLUMN_LABELS, HTTP_HEADERS,
+    MIN_DATE_PATTERNS_FOR_LLM,
 )
 from cache_manager import CacheManager
 from text_extractor import extract_date_text, extract_full_text
@@ -68,6 +70,7 @@ from regex_extractor import extract_with_regex
 from change_detector import (
     detect_changes, load_db_dates, ChangeReport,
 )
+from shallow_crawler import find_date_links, fetch_supplementary_text
 
 # F1: JS renderer (optional — gracefully absent if playwright not installed)
 try:
@@ -95,17 +98,17 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # Fixed URL list (fallback)
 # ─────────────────────────────────────────────
+
 URLS_FIJAS = [
-    "https://icacit.org.pe/symposium/important-dates/",
+    "https://icacit.org.pe/symposium/2025/",
     "https://comesyso.openpublish.eu/article/download",
     "https://eeeu25.gjem.press",
     "https://scrs.in/conference/csct2025",
-    "https://www.scrs.in/conference/csct2025",
     "https://worldcist.org",
     "https://seeu2026.gjem.press",
     "https://acdsa.org/2026/deadlines",
-    "https://scrs.in/conference/icitai2026",
     "https://scrs.in/conference/cml2026",
+    "https://scrs.in/conference/icitai2026",
     "https://scrs.in/conference/cvr2026",
     "https://scrs.in/conference/bida2026",
     "https://laccei.org/laccei2026/call-for-papers/",
@@ -117,15 +120,26 @@ URLS_FIJAS = [
     "https://theioes.org/air2026/index.php",
     "https://stai2026.estindiafoundation.org/",
     "https://scrs.in/conference/icivc2026",
+    "https://icepr.org",
     "https://scrs.in/conference/CIMA2026",
     "https://scrs.in/conference/icdsa2026",
     "https://www.icet.org",
     "https://scrs.in/conference/aic2026",
     "https://ieee-uemcon.org",
     "https://www.scrs.in/conference/ceee2026",
+    "https://icacit.org.pe/symposium/",
     "https://icdici.com/2026/",
+    "https://theioes.org/air2026",
+    "https://scrs.in/conference/pccda2026",
+    "https://theioes.org/conference/ijcaci2026",
+    "https://theioes.org/aita2026/",
+    "https://scrs.in/conference/cis2026",
+    "https://www.scrs.in/conference/iccis2026",
+    "https://scrs.in/conference/adcis2026",
+    "https://scrs.in/conference/icsiscet2026",
+    "https://scrs.in/conference/iti2026",
+    "https://scrs.in/conference/scis2026"
 ]
-
 
 # ═════════════════════════════════════════════
 #  URL LOADING
@@ -270,41 +284,18 @@ def _get_groq_client() -> Groq:
 
 
 _FULL_PROMPT = """\
-Extract conference dates from this text. Normalize ALL dates to YYYY-MM-DD.
-Use null for missing information.
+Dates→YYYY-MM-DD, null if missing. RULE: envio_trabajo<notificacion_aceptacion<inscripcion<fecha_inicio<=fecha_fin. Ignore past-year dates. JSON ONLY:
+{{"fecha_inicio":null,"fecha_fin":null,"envio_trabajo":null,"notificacion_aceptacion":null,"inscripcion":null,"temas":[]}}
 
-Return ONLY valid JSON (no markdown, no extra text):
-{{
-  "fecha_inicio": "YYYY-MM-DD" or null,
-  "fecha_fin": "YYYY-MM-DD" or null,
-  "envio_trabajo": "YYYY-MM-DD" or null,
-  "notificacion_aceptacion": "YYYY-MM-DD" or null,
-  "inscripcion": "YYYY-MM-DD" or null,
-  "temas": ["topic1", "topic2", ...] or []
-}}
-
-Text:
----
-{text}
----"""
+{text}"""
 
 _PARTIAL_PROMPT = """\
-I already extracted some dates from a conference page. I need you to find
-ONLY the missing fields listed below. Normalize ALL dates to YYYY-MM-DD.
-
-Already found:
-{found_json}
-
-Missing fields to find:
-{missing_fields}
-
-Return ONLY valid JSON with the missing fields (use null if not found):
+Found:{found_json}
+Find ONLY:{missing_fields}
+RULE: envio_trabajo<notificacion_aceptacion<inscripcion<fecha_inicio. Ignore past-year dates. JSON ONLY:
 {missing_template}
 
-Text:
----
-{text}
----"""
+{text}"""
 
 
 def _call_llm(prompt: str) -> str | None:
@@ -319,20 +310,12 @@ def _call_llm(prompt: str) -> str | None:
                 messages=[
                     {
                         "role": "system",
-                        "content": (
-                            "You are an expert at extracting structured information "
-                            "from academic conference web pages. "
-                            "Respond ONLY with valid JSON, no extra text."
-                        ),
+                        "content": "Extract conference dates as JSON only.",
                     },
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                # F5 fix: raised from 512 to 1024.
-                # The original 512 was enough for a clean 6-field JSON only
-                # if the model used minimal spacing.  With topics and longer
-                # date strings the response could be silently truncated.
-                max_tokens=1024,
+                max_tokens=512,
             )
             resp = completion.choices[0].message.content
             log.info("  [LLM] Response received (%d chars).", len(resp))
@@ -486,6 +469,76 @@ def llm_partial_extraction(text: str, found: dict) -> dict:
 
 
 # ═════════════════════════════════════════════
+#  TEMPORAL VALIDATION (Req 4)
+# ═════════════════════════════════════════════
+
+def validate_temporal_logic(dates: dict) -> dict:
+    """
+    Post-extraction sanity check.  Enforces the logical chain:
+        envio_trabajo ≤ notificacion_aceptacion ≤ inscripcion ≤ fecha_inicio ≤ fecha_fin
+
+    If any adjacent pair violates the order, the less-reliable field is
+    set to None.  Also discards dates from years before (current_year - 1).
+
+    Pure function — does not mutate the input dict.
+    """
+    result = dict(dates)
+    min_year = datetime.now().year - 1
+
+    # ── Step A: discard stale dates (past years) ──
+    for key in DATE_KEYS:
+        val = result.get(key)
+        if not val:
+            continue
+        try:
+            dt = datetime.strptime(val, "%Y-%m-%d").date()
+            if dt.year < min_year:
+                log.warning("  [Validation] %s = %s is from a past year — nullified.", key, val)
+                result[key] = None
+        except (ValueError, TypeError):
+            pass
+
+    # ── Step B: enforce temporal chain ──
+    # The expected order (each must be ≤ the next)
+    chain = [
+        "envio_trabajo",
+        "notificacion_aceptacion",
+        "inscripcion",
+        "fecha_inicio",
+        "fecha_fin",
+    ]
+
+    def _to_date(val: str | None) -> date_type | None:
+        if not val:
+            return None
+        try:
+            return datetime.strptime(val, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return None
+
+    for i in range(len(chain) - 1):
+        key_a, key_b = chain[i], chain[i + 1]
+        da, db = _to_date(result.get(key_a)), _to_date(result.get(key_b))
+        if da and db and da > db:
+            delta = (da - db).days
+            if delta <= 30:
+                # P6: minor overlap — log but preserve (e.g. on-site registration)
+                log.warning(
+                    "  [Validation] %s (%s) > %s (%s) by %d days — preserved (within tolerance).",
+                    key_a, result[key_a], key_b, result[key_b], delta,
+                )
+            else:
+                # Major violation — nullify the earlier, less-reliable field
+                log.warning(
+                    "  [Validation] %s (%s) > %s (%s) by %d days — nullified %s.",
+                    key_a, result[key_a], key_b, result[key_b], delta, key_a,
+                )
+                result[key_a] = None
+
+    return result
+
+
+# ═════════════════════════════════════════════
 #  MAIN PIPELINE (per URL)
 # ═════════════════════════════════════════════
 
@@ -525,6 +578,11 @@ def procesar_url(
         log.error("  Text extraction error: %s", exc)
         return {"url": url, **empty}, [], "error"
 
+    # ── Step 2.5: Count date hits for later decisions ──
+    crawl_used = False
+    from text_extractor import _DATE_PATTERN  # reuse existing regex
+    date_hits = len(_DATE_PATTERN.findall(date_text))
+
     # ── Step 3: Cache check (F3 fix) ──
     # Skip extraction only when BOTH conditions hold:
     #   a) content hash is unchanged
@@ -549,12 +607,50 @@ def procesar_url(
     regex_dates, confidence = extract_with_regex(date_text)
     method = f"{js_prefix}regex"
 
+    # ── Step 4.5 (P5): Shallow crawl if deadlines are missing ──
+    missing_deadlines = any(
+        regex_dates.get(k) is None
+        for k in ["envio_trabajo", "notificacion_aceptacion", "inscripcion"]
+    )
+    if date_hits < 3 or (date_hits < 5 and missing_deadlines):
+        sub_links = find_date_links(html, url)
+        if sub_links:
+            supplement = fetch_supplementary_text(sub_links, date_text)
+            if supplement.strip():
+                budget = MAX_SMART_TEXT_CHARS - len(date_text) - 20
+                if budget > 100:
+                    date_text = date_text + "\n--- SUB-PAGE ---\n" + supplement[:budget]
+                    crawl_used = True
+                    log.info("  [ShallowCrawl] Merged text now %d chars.", len(date_text))
+                    # Re-run regex on enriched text
+                    regex_dates, confidence = extract_with_regex(date_text)
+                    method = f"{js_prefix}regex"
+
     # ── Step 5: LLM decision based on confidence ──
-    if confidence >= REGEX_CONFIDENCE_HIGH:
-        log.info("  ✅ Regex confidence %.0f%% — skipping LLM.", confidence * 100)
-        dates = regex_dates
+    # P3 gate: skip LLM if page has no date content at all
+    if confidence == 0 and date_hits < MIN_DATE_PATTERNS_FOR_LLM:
+        log.info("  ⛔ No date content detected — skipping LLM.")
+        dates = {k: None for k in DATE_KEYS}
         dates["temas"] = []
-        method = f"{js_prefix}regex"
+        method = "no-content"
+    elif confidence >= REGEX_CONFIDENCE_HIGH:
+        # P7: even at high confidence, fill missing fields via partial LLM
+        missing = [k for k in DATE_KEYS if regex_dates.get(k) is None]
+        if missing:
+            log.info("  ✅ Regex %.0f%% but %d field(s) missing — partial LLM.",
+                     confidence * 100, len(missing))
+            try:
+                dates = llm_partial_extraction(date_text, regex_dates)
+                method = f"{js_prefix}regex+llm"
+            except ValueError as exc:
+                log.error("  %s", exc)
+                dates = regex_dates
+                dates.setdefault("temas", [])
+        else:
+            log.info("  ✅ Regex confidence %.0f%% — skipping LLM.", confidence * 100)
+            dates = regex_dates
+            dates["temas"] = []
+            method = f"{js_prefix}regex"
     elif confidence >= REGEX_CONFIDENCE_PARTIAL:
         log.info("  ⚡ Regex confidence %.0f%% — partial LLM call.", confidence * 100)
         try:
@@ -576,6 +672,13 @@ def procesar_url(
             log.error("  %s", exc)
             dates = regex_dates
             dates.setdefault("temas", [])
+
+    # ── Step 5.5: Temporal validation (Req 4) ──
+    dates = validate_temporal_logic(dates)
+
+    # Append "+crawl" to method if shallow crawling was used
+    if crawl_used:
+        method += "+crawl"
 
     # ── Step 6: Update cache ──
     # is_valid is inferred inside CacheManager.update() from dates values.

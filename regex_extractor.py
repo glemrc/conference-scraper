@@ -74,6 +74,7 @@ _LABEL_PATTERNS: dict[str, list[str]] = {
     ],
     "notificacion_aceptacion": [
         r"(?:notification|notice)\s+of\s+(?:acceptance|accept)",
+        r"(?:Notification|Notice)\s+of\s+(?:Acceptance|Accept)",
         r"(?:author|paper)\s+(?:notification|acceptance)",
         r"acceptance\s+(?:notification|notice|decision)",
         r"review\s+(?:notification|results?|decision)",
@@ -268,6 +269,67 @@ def _try_multiline_range(text: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _infer_end_date_from_context(text: str, start_date_str: str) -> str | None:
+    """
+    P4 fix: when fecha_inicio was found but fecha_fin was not captured by
+    any range or label pattern, scan the lines near the start-date match
+    for a second date that is >= start and within 30 days.
+
+    Conservative guards:
+      - Only considers dates within 30 days of start (avoids grabbing a
+        submission deadline as end date).
+      - Skips lines that match deadline-related keywords.
+    """
+    from datetime import datetime as _dt, timedelta
+
+    try:
+        start_dt = _dt.strptime(start_date_str, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+    max_end = start_dt + timedelta(days=30)
+    deadline_keywords = re.compile(
+        r"submission|deadline|notification|acceptance|registration|inscripci",
+        re.IGNORECASE,
+    )
+
+    lines = text.split("\n")
+    # Find the line where start_date appears
+    start_line_idx = None
+    for i, line in enumerate(lines):
+        m = _DATE_RE.search(line)
+        if m and _normalize_date(m.group(0)) == start_date_str:
+            start_line_idx = i
+            break
+
+    if start_line_idx is None:
+        return None
+
+    # Scan next 8 lines for a candidate end date
+    for offset in range(1, 9):
+        idx = start_line_idx + offset
+        if idx >= len(lines):
+            break
+        line = lines[idx]
+        # Skip lines with deadline keywords
+        if deadline_keywords.search(line):
+            continue
+        m = _DATE_RE.search(line)
+        if not m:
+            continue
+        candidate = _normalize_date(m.group(0))
+        if not candidate:
+            continue
+        try:
+            cand_dt = _dt.strptime(candidate, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if start_dt <= cand_dt <= max_end:
+            return candidate
+
+    return None
+
+
 # ─── Public API ──────────────────────────────────────────────────────
 
 def extract_with_regex(text: str) -> tuple[dict, float]:
@@ -313,6 +375,13 @@ def extract_with_regex(text: str) -> tuple[dict, float]:
             if val:
                 results["fecha_fin"] = val
                 break
+
+    # ── conference end (contextual inference, P4 new) ──
+    if not results["fecha_fin"] and results["fecha_inicio"]:
+        inferred = _infer_end_date_from_context(text, results["fecha_inicio"])
+        if inferred:
+            results["fecha_fin"] = inferred
+            log.info("  [RegexExtractor] Inferred fecha_fin=%s from context.", inferred)
 
     # ── other fields ──
     for key in ["envio_trabajo", "notificacion_aceptacion", "inscripcion"]:

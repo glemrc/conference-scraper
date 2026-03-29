@@ -1,32 +1,3 @@
-"""
-text_extractor.py
-=================
-Layer 2: Smart text extraction — pulls only date-relevant sections
-from the HTML instead of dumping the entire page to the LLM.
-
-F2 fix — div-based layouts:
-  Added Strategy 4 (_extract_by_divs) that scans generic block-level
-  containers (div, section, article) for date content.  This covers the
-  large majority of modern conference sites that use CSS-grid or flexbox
-  layouts instead of semantic <table>/<dl> elements.
-  The strategy includes a containment deduplication pass to avoid returning
-  the same text block multiple times when parent divs contain child divs.
-
-F5 fix — priority-aware truncation:
-  _prioritize_text() re-orders extracted sections so that the block that
-  most strongly matches "Important Dates" keywords appears first.  This
-  ensures the most valuable content is preserved when MAX_SMART_TEXT_CHARS
-  is reached.  The character budget is consumed from highest-priority
-  sections down, rather than cutting at a fixed offset.
-
-Strategy order (in priority):
-  1. Headings-based sections (h1–h6 with date keywords)
-  2. Semantic containers: <table>, <dl>, <ul>, <ol>
-  3. Generic block containers: <div>, <section>, <article>  ← F2 new
-  4. Context-window around date patterns in full text
-  5. Full cleaned text (hard fallback, capped)
-"""
-
 import re
 import logging
 

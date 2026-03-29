@@ -22,7 +22,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import CACHE_FILE
+from config import CACHE_FILE, CACHE_MIN_FIELDS
 
 log = logging.getLogger(__name__)
 
@@ -36,11 +36,11 @@ def _hash_text(text: str) -> str:
 
 def _result_is_valid(dates: dict) -> bool:
     """
-    A result is considered valid when at least one date field is non-None.
-    An all-None dict (e.g. every key maps to None) is *not* valid and must
-    not be cached as a successful extraction.
+    P1 fix: a result is valid only when at least CACHE_MIN_FIELDS date
+    fields are non-None.  Sub-threshold results (1-2/5) are stored for
+    hash tracking but always re-extracted on the next run.
     """
-    return any(v is not None for v in dates.values())
+    return sum(1 for v in dates.values() if v is not None) >= CACHE_MIN_FIELDS
 
 
 # ─── public API ─────────────────────────────────────────────────────

@@ -13,7 +13,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 CACHE_FILE = BASE_DIR / "scraper_cache.json"
-OUTPUT_FILE = BASE_DIR / "reporte_conferencias_v2.xlsx"
+OUTPUT_FILE = BASE_DIR / "reporte_conferencias_nuevas.xlsx"
 DB_FILE = BASE_DIR / "Proceeding BD.xlsx"  # existing database
 
 # ─────────────────────────────────────────────
@@ -35,6 +35,8 @@ MAX_SMART_TEXT_CHARS = 3_000  # max chars from smart extraction
 # ─────────────────────────────────────────────
 REGEX_CONFIDENCE_HIGH = 0.7   # skip LLM entirely
 REGEX_CONFIDENCE_PARTIAL = 0.3  # call LLM only for missing fields
+CACHE_MIN_FIELDS = 3            # P1: min filled date fields for cache "valid"
+MIN_DATE_PATTERNS_FOR_LLM = 2   # P3: min date patterns to justify an LLM call
 
 # ─────────────────────────────────────────────
 # Date field keys (internal canonical names)
