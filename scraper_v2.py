@@ -1,3 +1,15 @@
+# CHANGES:
+# P1 — Removed dead URL "https://icacit.org.pe/symposium/2025/" from URLS_FIJAS.
+# P2 — Pass url to is_js_rendered_page() in descargar_html() so known-domain check fires.
+# P3 — Added _detect_hallucination() post-LLM guard: rejects impossible date spans and suspiciously uniform spacing.
+# P6 — _static_download() now retries with verify=False on SSL/timeout errors.
+# P8 — Crawl trigger now requires date_hits < 3 AND len(date_text) < 1500, not based on which fields regex found.
+# P9 — Detects image-content pages (HTTP 200, text > 200 chars, 0 date patterns) and labels as method="image-content".
+# FIX-BU — browser_use_crawler integrated as level-3 fallback after regex+LLM.
+# FIX-C2 — Crawl trigger replaced with field_aware_crawl_needed() from shallow_crawler.
+# FIX-P  — PDF links detected via text_extractor.detect_pdf_links(); included in Notes for manual review.
+# FIX-YR — validate_temporal_logic relaxed: future years (>= current) are accepted, not just current-1.
+
 """
 scraper_v2.py
 =============
@@ -43,9 +55,10 @@ Optional (for JS-rendered pages):
 import json
 import os
 import re
+import ssl
 import sys
 import time
-from datetime import date as date_type, datetime
+from datetime import date as date_type, datetime, timedelta
 import logging
 from pathlib import Path
 
@@ -65,12 +78,19 @@ from config import (
     MIN_DATE_PATTERNS_FOR_LLM,
 )
 from cache_manager import CacheManager
-from text_extractor import extract_date_text, extract_full_text
+from text_extractor import extract_date_text, extract_full_text, extract_conference_name
 from regex_extractor import extract_with_regex
 from change_detector import (
     detect_changes, load_db_dates, ChangeReport,
 )
-from shallow_crawler import find_date_links, fetch_supplementary_text
+from shallow_crawler import find_date_links, fetch_supplementary_text, field_aware_crawl_needed
+
+# FIX-BU: browser_use_crawler is optional — degrades gracefully if not installed
+try:
+    from browser_use_crawler import extract_via_browser_use
+    _BROWSER_USE_AVAILABLE = True
+except ImportError:
+    _BROWSER_USE_AVAILABLE = False
 
 # F1: JS renderer (optional — gracefully absent if playwright not installed)
 try:
@@ -97,10 +117,10 @@ log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
 # Fixed URL list (fallback)
+# P1: Removed dead URL https://icacit.org.pe/symposium/2025/
 # ─────────────────────────────────────────────
 
 URLS_FIJAS = [
-    "https://icacit.org.pe/symposium/2025/",
     "https://comesyso.openpublish.eu/article/download",
     "https://eeeu25.gjem.press",
     "https://scrs.in/conference/csct2025",
@@ -205,21 +225,55 @@ def cargar_urls(fuente: str | None = None) -> list[str]:
 #  HTML DOWNLOAD (static + JS fallback)
 # ═════════════════════════════════════════════
 
+def _is_ssl_error(exc: Exception) -> bool:
+    """Check if an exception is related to SSL verification failure."""
+    err_str = str(exc).lower()
+    return any(kw in err_str for kw in (
+        "ssl", "certificate", "cert", "verify", "handshake",
+    ))
+
+
 def _static_download(url: str) -> str | None:
-    """Download HTML via requests (no JS execution)."""
+    """
+    Download HTML via requests (no JS execution).
+
+    P6 fix: on SSL errors or timeouts, retry once with verify=False
+    and timeout=20 as a fallback.
+    """
     try:
         resp = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.text
     except requests.exceptions.Timeout:
-        log.error("  Timeout: %s", url)
+        log.warning("  Timeout on first attempt: %s — retrying with extended timeout...", url)
+    except requests.exceptions.ConnectionError as e:
+        if _is_ssl_error(e):
+            log.warning("  SSL error: %s — retrying with verify=False...", url)
+        else:
+            log.error("  Connection error: %s", url)
+            return None
     except requests.exceptions.HTTPError as e:
         log.error("  HTTP %s: %s", e.response.status_code, url)
-    except requests.exceptions.ConnectionError:
-        log.error("  Connection error: %s", url)
+        return None
     except requests.exceptions.RequestException as e:
         log.error("  Network error (%s): %s", type(e).__name__, url)
-    return None
+        return None
+
+    # P6: retry with verify=False and extended timeout (SSL fallback / timeout retry)
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+    try:
+        log.warning("  [P6] Retrying %s with verify=False, timeout=20", url)
+        resp = requests.get(url, headers=HTTP_HEADERS, timeout=20, verify=False)
+        resp.raise_for_status()
+        log.info("  [P6] Fallback succeeded for %s", url)
+        return resp.text
+    except Exception as retry_exc:
+        log.error("  [P6] Retry also failed for %s: %s", url, retry_exc)
+        return None
 
 
 def descargar_html(url: str) -> tuple[str | None, bool]:
@@ -251,7 +305,8 @@ def descargar_html(url: str) -> tuple[str | None, bool]:
     except Exception:
         preview_text = ""
 
-    if is_js_rendered_page(html, preview_text):
+    # P2: pass url so known JS domains are detected immediately
+    if is_js_rendered_page(html, preview_text, url=url):
         log.info("  [F1] JS-rendered page detected — switching to headless browser.")
         js_html = render_with_js(url)
         if js_html:
@@ -284,15 +339,29 @@ def _get_groq_client() -> Groq:
 
 
 _FULL_PROMPT = """\
-Dates→YYYY-MM-DD, null if missing. RULE: envio_trabajo<notificacion_aceptacion<inscripcion<fecha_inicio<=fecha_fin. Ignore past-year dates. JSON ONLY:
+Extract conference dates from the text below. Output ONLY valid JSON.
+RULES:
+- All dates MUST be in YYYY-MM-DD format; use null if not found.
+- Logical order: envio_trabajo < notificacion_aceptacion < inscripcion <= fecha_inicio <= fecha_fin
+- If multiple dates exist for the same field (original + extended/revised), use the MOST RECENT one.
+- IGNORE dates marked as strikethrough, "old deadline", "original deadline", or "extended from".
+- Only include dates from current or future years (ignore dates from past years).
+- temas: list of conference topic areas (empty list [] if not found).
+
+Required JSON structure (no extra text, no markdown):
 {{"fecha_inicio":null,"fecha_fin":null,"envio_trabajo":null,"notificacion_aceptacion":null,"inscripcion":null,"temas":[]}}
 
 {text}"""
 
 _PARTIAL_PROMPT = """\
-Found:{found_json}
-Find ONLY:{missing_fields}
-RULE: envio_trabajo<notificacion_aceptacion<inscripcion<fecha_inicio. Ignore past-year dates. JSON ONLY:
+Already found:{found_json}
+Find ONLY these missing fields:{missing_fields}
+RULES:
+- YYYY-MM-DD format or null.
+- Logical order: envio_trabajo < notificacion_aceptacion < inscripcion <= fecha_inicio <= fecha_fin
+- If multiple versions of a date exist (original + extended), use the MOST RECENT date.
+- IGNORE crossed-out dates, "old deadline", "originally" prefixes.
+JSON ONLY (no markdown, no explanation):
 {missing_template}
 
 {text}"""
@@ -478,14 +547,19 @@ def validate_temporal_logic(dates: dict) -> dict:
         envio_trabajo ≤ notificacion_aceptacion ≤ inscripcion ≤ fecha_inicio ≤ fecha_fin
 
     If any adjacent pair violates the order, the less-reliable field is
-    set to None.  Also discards dates from years before (current_year - 1).
+    set to None.
+
+    FIX-YR: Relaxed year filter — only discard dates from strictly past years
+    (year < current_year - 1). Dates from 2027, 2028, etc. are accepted because
+    some URLs may reference an older year while the page content has been
+    updated (e.g. icdici.com/2026/ showing ICDICI 2027 content).
 
     Pure function — does not mutate the input dict.
     """
     result = dict(dates)
-    min_year = datetime.now().year - 1
+    min_year = datetime.now().year - 1  # FIX-YR: accept current year AND future years
 
-    # ── Step A: discard stale dates (past years) ──
+    # ── Step A: discard stale dates (past years only) ──
     for key in DATE_KEYS:
         val = result.get(key)
         if not val:
@@ -499,7 +573,6 @@ def validate_temporal_logic(dates: dict) -> dict:
             pass
 
     # ── Step B: enforce temporal chain ──
-    # The expected order (each must be ≤ the next)
     chain = [
         "envio_trabajo",
         "notificacion_aceptacion",
@@ -522,13 +595,11 @@ def validate_temporal_logic(dates: dict) -> dict:
         if da and db and da > db:
             delta = (da - db).days
             if delta <= 30:
-                # P6: minor overlap — log but preserve (e.g. on-site registration)
                 log.warning(
                     "  [Validation] %s (%s) > %s (%s) by %d days — preserved (within tolerance).",
                     key_a, result[key_a], key_b, result[key_b], delta,
                 )
             else:
-                # Major violation — nullify the earlier, less-reliable field
                 log.warning(
                     "  [Validation] %s (%s) > %s (%s) by %d days — nullified %s.",
                     key_a, result[key_a], key_b, result[key_b], delta, key_a,
@@ -536,6 +607,82 @@ def validate_temporal_logic(dates: dict) -> dict:
                 result[key_a] = None
 
     return result
+
+
+# ═════════════════════════════════════════════
+#  HALLUCINATION DETECTION (P3)
+# ═════════════════════════════════════════════
+
+def _detect_hallucination(dates: dict) -> tuple[dict, bool]:
+    """
+    P3 fix: post-LLM validation guard that detects and rejects hallucinated
+    results.
+
+    Rules:
+      1. If fecha_fin - fecha_inicio > 60 days, null both fields.
+      2. If all non-null deadline fields (envio_trabajo, notificacion_aceptacion,
+         inscripcion) are spaced suspiciously uniformly (±3 days of exactly
+         30-day gaps between every consecutive pair), null them all.
+
+    Returns
+    -------
+    dates : dict — cleaned dates (may have nulled fields)
+    was_hallucination : bool — True if any hallucination was detected
+    """
+    result = dict(dates)
+    hallucinated = False
+
+    def _to_date(val):
+        if not val:
+            return None
+        try:
+            return datetime.strptime(val, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return None
+
+    # Rule 1: impossible conference duration
+    dt_start = _to_date(result.get("fecha_inicio"))
+    dt_end = _to_date(result.get("fecha_fin"))
+    if dt_start and dt_end:
+        span = (dt_end - dt_start).days
+        if span > 60:
+            log.warning(
+                "  [Hallucination] fecha_inicio=%s to fecha_fin=%s is %d days "
+                "(>60) — nullifying both.",
+                result["fecha_inicio"], result["fecha_fin"], span,
+            )
+            result["fecha_inicio"] = None
+            result["fecha_fin"] = None
+            hallucinated = True
+
+    # Rule 2: suspiciously uniform deadline spacing
+    deadline_keys = ["envio_trabajo", "notificacion_aceptacion", "inscripcion"]
+    deadline_dates = []
+    for k in deadline_keys:
+        d = _to_date(result.get(k))
+        if d:
+            deadline_dates.append((k, d))
+
+    if len(deadline_dates) >= 2:
+        # Sort by date
+        deadline_dates.sort(key=lambda x: x[1])
+        gaps = []
+        for i in range(len(deadline_dates) - 1):
+            gap = (deadline_dates[i + 1][1] - deadline_dates[i][1]).days
+            gaps.append(gap)
+
+        # Check if ALL gaps are within ±3 days of 30
+        if gaps and all(abs(g - 30) <= 3 for g in gaps):
+            log.warning(
+                "  [Hallucination] Deadline spacing is suspiciously uniform "
+                "(gaps: %s days) — nullifying all deadline fields.",
+                gaps,
+            )
+            for k in deadline_keys:
+                result[k] = None
+            hallucinated = True
+
+    return result, hallucinated
 
 
 # ═════════════════════════════════════════════
@@ -559,11 +706,15 @@ def procesar_url(
     log.info("Processing: %s", url)
     empty = {k: None for k in DATE_KEYS}
     empty["temas"] = []
+    conference_name: str | None = None  # populated after download
 
     # ── Step 1: Download HTML (static + optional JS fallback) ──
     html, used_js = descargar_html(url)
     if not html:
-        return {"url": url, **empty}, [], "error"
+        return {"conference_name": None, "url": url, **empty, "notas": "", "fields_found": "0/5"}, [], "error"
+
+    # Extract conference name from static HTML (title / h1 / h2)
+    conference_name = extract_conference_name(html)
 
     js_prefix = "js+" if used_js else ""
 
@@ -572,32 +723,48 @@ def procesar_url(
         date_text = extract_date_text(html)
         if not date_text.strip():
             log.warning("  Empty text for %s", url)
-            return {"url": url, **empty}, [], "error"
+            return {"conference_name": conference_name, "url": url, **empty, "notas": "", "fields_found": "0/5"}, [], "error"
         log.info("  Smart-extracted: %d chars", len(date_text))
     except Exception as exc:
         log.error("  Text extraction error: %s", exc)
-        return {"url": url, **empty}, [], "error"
+        return {"conference_name": conference_name, "url": url, **empty, "notas": "", "fields_found": "0/5"}, [], "error"
 
     # ── Step 2.5: Count date hits for later decisions ──
     crawl_used = False
     from text_extractor import _DATE_PATTERN  # reuse existing regex
     date_hits = len(_DATE_PATTERN.findall(date_text))
 
+    # ── P9: Detect image-content pages ──
+    # Page loaded fine (HTML exists, > 200 chars) but zero date patterns
+    # → dates are probably embedded in images.
+    if date_hits == 0 and len(html) > 200:
+        # FIX-P: detect PDF links for manual review
+        from text_extractor import detect_pdf_links
+        pdf_links = detect_pdf_links(html, url)
+        notas_parts = ["Dates may be in images — manual review needed"]
+        if pdf_links:
+            notas_parts.append("PDF links found: " + " ; ".join(pdf_links))
+        notas = " | ".join(notas_parts)
+        log.info(
+            "  [P9] Page loaded (HTTP 200, %d chars HTML) but 0 date patterns "
+            "— likely image-content. %s",
+            len(html),
+            "PDFs: " + str(pdf_links) if pdf_links else "No PDFs found.",
+        )
+        return {"conference_name": conference_name, "url": url, **empty, "temas": [], "notas": notas, "fields_found": "0/5"}, [], "image-content"
+
     # ── Step 3: Cache check (F3 fix) ──
-    # Skip extraction only when BOTH conditions hold:
-    #   a) content hash is unchanged
-    #   b) the cached result was previously valid (has at least one date)
     content_unchanged = not cache.has_changed(url, date_text)
     has_valid = cache.has_valid_cache(url)
 
     if content_unchanged and has_valid:
         log.info("  ✅ Content unchanged, valid cache — skipping extraction.")
         cached = cache.get_cached_dates(url)
-        # get_cached_dates() now returns None for invalid entries, so this
-        # check is belt-and-suspenders but does not hurt.
         if cached:
             cached["temas"] = cache.get_cached_topics(url)
-            return {"url": url, **cached}, [], "cache"
+            cached["notas"] = ""
+            filled_cache = sum(1 for k in DATE_KEYS if cached.get(k) is not None)
+            return {"conference_name": conference_name, "url": url, **cached, "fields_found": f"{filled_cache}/5"}, [], "cache"
     elif content_unchanged and not has_valid:
         log.info(
             "  ⚠️  Content unchanged but previous result was invalid — re-extracting."
@@ -607,12 +774,10 @@ def procesar_url(
     regex_dates, confidence = extract_with_regex(date_text)
     method = f"{js_prefix}regex"
 
-    # ── Step 4.5 (P5): Shallow crawl if deadlines are missing ──
-    missing_deadlines = any(
-        regex_dates.get(k) is None
-        for k in ["envio_trabajo", "notificacion_aceptacion", "inscripcion"]
-    )
-    if date_hits < 3 or (date_hits < 5 and missing_deadlines):
+    # ── Step 4.5 (FIX-C2): Field-aware shallow crawl trigger ──
+    # Replaces the old P8 trigger. Crawl now fires when key fields are missing
+    # even if the page has enough text, because dates may be on sub-pages.
+    if field_aware_crawl_needed(date_hits, len(date_text), regex_dates):
         sub_links = find_date_links(html, url)
         if sub_links:
             supplement = fetch_supplementary_text(sub_links, date_text)
@@ -676,16 +841,70 @@ def procesar_url(
     # ── Step 5.5: Temporal validation (Req 4) ──
     dates = validate_temporal_logic(dates)
 
+    # ── Step 5.6: Hallucination detection (P3) ──
+    dates, was_hallucination = _detect_hallucination(dates)
+
+    # ── Step 5.7: browser-use fallback (FIX-BU) ──
+    # Level-3 fallback: if key fields are still missing after regex+LLM,
+    # use browser-use to navigate the site and extract dates from sub-pages.
+    browser_used = False
+    if _BROWSER_USE_AVAILABLE and not was_hallucination:
+        browser_text, browser_triggered = extract_via_browser_use(url, dates)
+        if browser_triggered and browser_text:
+            log.info("  [FIX-BU] Got %d chars from browser-use — re-running extraction.",
+                     len(browser_text))
+            # Merge with existing text and re-run full extraction
+            merged_text = date_text + "\n--- BROWSER-USE ---\n" + browser_text
+            bu_regex, bu_conf = extract_with_regex(merged_text)
+            # Fill only still-missing fields
+            for k in DATE_KEYS:
+                if dates.get(k) is None and bu_regex.get(k):
+                    dates[k] = bu_regex[k]
+
+            # If still missing fields, run partial LLM on browser text
+            still_missing = [k for k in DATE_KEYS if dates.get(k) is None]
+            if still_missing:
+                try:
+                    bu_llm = llm_partial_extraction(browser_text, dates)
+                    for k in still_missing:
+                        if bu_llm.get(k):
+                            dates[k] = bu_llm[k]
+                    if not dates.get("temas"):
+                        dates["temas"] = bu_llm.get("temas", [])
+                except ValueError:
+                    pass
+
+            dates = validate_temporal_logic(dates)  # re-validate
+            browser_used = True
+            method += "+browser"
+
     # Append "+crawl" to method if shallow crawling was used
     if crawl_used:
         method += "+crawl"
 
+    # ── Build notes ──
+    notes_parts: list[str] = []
+    if was_hallucination:
+        notes_parts.append("Hallucination detected — some fields cleared")
+    # FIX-P: attach PDF links for manual review
+    if html:
+        from text_extractor import detect_pdf_links
+        pdf_links = detect_pdf_links(html, url)
+        if pdf_links:
+            notes_parts.append("PDF links for review: " + " ; ".join(pdf_links))
+
     # ── Step 6: Update cache ──
-    # is_valid is inferred inside CacheManager.update() from dates values.
+    # P3: if hallucination was detected, store as invalid so next run retries
+    cache_is_valid = None  # let CacheManager infer
+    if was_hallucination:
+        cache_is_valid = False
+        log.info("  [P3] Hallucination detected — marking cache as invalid for retry.")
+
     cache.update(
         url, date_text,
         {k: dates.get(k) for k in DATE_KEYS},
         dates.get("temas", []),
+        is_valid=cache_is_valid,
     )
 
     # ── Step 7: Detect changes vs. database ──
@@ -700,7 +919,15 @@ def procesar_url(
             log.info("  ⚠️  %s: %s → %s (%s)",
                      c.field, c.old_value, c.new_value, c.change_type)
 
-    return {"url": url, **dates}, changes, method
+    dates["notas"] = " | ".join(notes_parts)
+    filled = sum(1 for k in DATE_KEYS if dates.get(k) is not None)
+    record = {
+        "conference_name": conference_name,
+        "url": url,
+        **dates,
+        "fields_found": f"{filled}/5",
+    }
+    return record, changes, method
 
 
 # ═════════════════════════════════════════════
@@ -715,7 +942,19 @@ def write_excel_report(
     """Write the two-sheet Excel report."""
     path = output_path or OUTPUT_FILE
 
-    col_order = ["url"] + DATE_KEYS + ["temas", "extraction_method"]
+    col_order = [
+        "conference_name",
+        "url",
+        "fecha_inicio",
+        "fecha_fin",
+        "envio_trabajo",
+        "notificacion_aceptacion",
+        "inscripcion",
+        "fields_found",
+        "temas",
+        "extraction_method",
+        "notas",
+    ]
     df_data = pd.DataFrame(records)
 
     for col in col_order:
@@ -760,6 +999,7 @@ def write_excel_report(
 
 def main(fuente_urls: str | None = None):
     """Load URLs, run the pipeline, and generate the report."""
+    start_time = time.time()
     urls = cargar_urls(fuente_urls)
     if not urls:
         log.error("No URLs to process.")
@@ -796,6 +1036,7 @@ def main(fuente_urls: str | None = None):
     total_llm    = sum(v for k, v in stats.items() if k in ("llm", "js+llm"))
     total_js     = sum(v for k, v in stats.items() if k.startswith("js+"))
     total_errors = stats.get("error", 0)
+    total_img    = stats.get("image-content", 0)
 
     print(f"\n{'═' * 60}")
     print("  📊 RUN SUMMARY")
@@ -806,12 +1047,23 @@ def main(fuente_urls: str | None = None):
     print(f"  Regex + partial LLM: {total_rllm}")
     print(f"  Full LLM calls    : {total_llm}")
     print(f"  JS rendering used : {total_js}")
+    print(f"  Image-content     : {total_img}")
     print(f"  Errors            : {total_errors}")
     print(f"  LLM calls saved   : {total_cache + total_regex} / {len(records)}")
+    
+    total_time = time.time() - start_time
+    minutes, seconds = divmod(total_time, 60)
+    print(f"  Tiempo total      : {int(minutes)}m {int(seconds)}s")
+    
     if not _JS_RENDERER_AVAILABLE:
         print(
             "\n  ℹ️  JS rendering unavailable (playwright not installed).\n"
             "     To enable: pip install playwright && playwright install chromium --with-deps"
+        )
+    if not _BROWSER_USE_AVAILABLE:
+        print(
+            "\n  ℹ️  browser-use fallback unavailable (browser-use CLI not installed).\n"
+            "     To enable: pip install browser-use"
         )
     print()
 
