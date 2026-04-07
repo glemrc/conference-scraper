@@ -138,6 +138,19 @@ def _scroll_and_collect() -> str:
     return "\n".join(unique)
 
 
+def _extract_structured_elements() -> str:
+    """
+    BU-R3: Extract text from <table>, <dl>, and <ul> elements via JS eval.
+    These elements often contain structured date lists in conference pages.
+    Returns concatenated text, or empty string on failure.
+    """
+    js = (
+        "Array.from(document.querySelectorAll('table, dl, ul'))"
+        ".map(el => el.innerText).join('\\n---\\n')"
+    )
+    return _run_bu(["eval", js], timeout=10)
+
+
 def _close_session() -> None:
     """Close the browser-use session cleanly."""
     _run_bu(["close"], timeout=8)
@@ -184,6 +197,11 @@ def navigate_and_extract(url: str) -> Optional[str]:
 
         # 4. Collect rendered HTML (with scrolling)
         rendered_html = _scroll_and_collect()
+
+        # BU-R3: also extract structured elements (tables, definition lists, lists)
+        structured = _extract_structured_elements()
+        if structured.strip():
+            rendered_html = rendered_html + "\n--- STRUCTURED ---\n" + structured
 
         if not rendered_html.strip():
             log.warning("  [BrowserUse] Empty HTML from browser — nothing to extract.")
