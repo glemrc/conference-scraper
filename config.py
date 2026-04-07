@@ -1,3 +1,6 @@
+# CHANGES:
+# P9 — Added "notas" / "Notes" to COLUMN_LABELS for image-content detection output.
+
 """
 config.py
 =========
@@ -13,7 +16,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 CACHE_FILE = BASE_DIR / "scraper_cache.json"
-OUTPUT_FILE = BASE_DIR / "reporte_conferencias_nuevas.xlsx"
+OUTPUT_FILE = BASE_DIR / "fechas_conferencias_v3.xlsx"
 DB_FILE = BASE_DIR / "Proceeding BD.xlsx"  # existing database
 
 # ─────────────────────────────────────────────
@@ -51,14 +54,17 @@ DATE_KEYS = [
 
 # Column mapping: internal key → Excel column header
 COLUMN_LABELS = {
+    "conference_name": "Conference Name",
     "url": "URL",
     "fecha_inicio": "Start Date",
     "fecha_fin": "End Date",
     "envio_trabajo": "Submission Deadline",
     "notificacion_aceptacion": "Acceptance Notification",
     "inscripcion": "Registration Deadline",
+    "fields_found": "Fields Found",
     "temas": "Topics",
     "extraction_method": "Method",
+    "notas": "Notes",
 }
 
 # ─────────────────────────────────────────────
