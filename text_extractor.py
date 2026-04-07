@@ -1,3 +1,7 @@
+# CHANGES:
+# FIX-S1 — _clean_soup: remove <s>/<del>/<strike> to avoid strikethrough date confusion.
+# FIX-S2 — _normalize_whitespace: replace en-dash/em-dash with hyphen for regex compat.
+# FIX-S3 — Added more section keywords: 'notification', 'key date', PDF link detection.
 import re
 import logging
 
@@ -27,6 +31,13 @@ _SECTION_KEYWORDS = [
     "envío",
     "inscripci",
     "aceptaci",
+    # FIX-S3: more coverage
+    "author notification",
+    "paper notification",
+    "conference dates",
+    "event date",
+    "program date",
+    "schedule",
 ]
 
 # Higher-priority keywords: sections containing these are placed first.
@@ -63,12 +74,30 @@ _DATE_PATTERN = re.compile(
 # ─── internal helpers ───────────────────────────────────────────────
 
 def _clean_soup(html: str) -> BeautifulSoup:
-    """Parse HTML and strip non-content tags."""
+    """Parse HTML and strip non-content tags.
+
+    FIX-S1: Also removes strikethrough tags (<s>, <del>, <strike>) so that
+    "extended" / "replaced" dates inside those tags don't pollute the text.
+    FIX-S2: Normalises Unicode dashes (\u2013 en-dash, \u2014 em-dash) to
+    ASCII hyphen so downstream regex patterns match correctly.
+    """
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header",
                      "noscript", "aside", "iframe", "svg", "form"]):
         tag.decompose()
+    # FIX-S1: Remove strikethrough / deleted text (old/crossed-out dates)
+    for tag in soup(["s", "del", "strike"]):
+        tag.decompose()
     return soup
+
+
+def _normalize_dashes(text: str) -> str:
+    """FIX-S2: Replace en-dash (\u2013) and em-dash (\u2014) with hyphen-minus.
+
+    This ensures date patterns like '03 \u2013 04 April 2026' are matched by
+    the standard regex that only looks for ASCII '-'.
+    """
+    return text.replace("\u2013", "-").replace("\u2014", "-")
 
 
 def _matches_keyword(text: str) -> bool:
@@ -241,15 +270,71 @@ def extract_full_text(html: str) -> str:
     """Fallback: clean and return full page text (capped)."""
     soup = _clean_soup(html)
     text = soup.get_text(separator="\n", strip=True)
+    text = _normalize_dashes(text)  # FIX-S2
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text[:MAX_TEXT_CHARS]
+
+
+def detect_pdf_links(html: str, base_url: str = "") -> list[str]:
+    """FIX-S3: Detect PDF links in the HTML for manual review flagging.
+
+    Returns a list of resolved PDF URLs found on the page (e.g. brochures,
+    programmes that may contain date information). Callers append these to
+    the 'Notes' column so the user can download them for manual review.
+    """
+    from urllib.parse import urljoin
+    soup = BeautifulSoup(html, "html.parser")
+    pdf_urls: list[str] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().endswith(".pdf") or "pdf" in href.lower():
+            resolved = urljoin(base_url, href) if base_url else href
+            if resolved not in seen:
+                seen.add(resolved)
+                pdf_urls.append(resolved)
+    return pdf_urls[:5]  # cap at 5 to keep Notes readable
+
+
+# ─── Conference name extraction ─────────────────────────────────────
+
+_CONF_NAME_RE = re.compile(r"\b([A-Z]{2,8}\s+\d{4})\b")
+
+
+def extract_conference_name(html: str) -> str | None:
+    """
+    Extract conference name in 'ACRONYM YEAR' format (e.g. 'ICOAMP 2026')
+    from the page <title>, <h1>, and <h2> tags.
+
+    Returns the first match found, or None.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    candidates: list[str] = []
+
+    title_tag = soup.find("title")
+    if title_tag:
+        candidates.append(title_tag.get_text(strip=True))
+
+    for tag_name in ("h1", "h2"):
+        for tag in soup.find_all(tag_name):
+            text = tag.get_text(strip=True)
+            if text:
+                candidates.append(text)
+
+    for candidate in candidates:
+        m = _CONF_NAME_RE.search(candidate)
+        if m:
+            return m.group(1)
+
+    return None
 
 
 def extract_date_text(html: str) -> str:
     """
     Smart extraction: return only the date-relevant portions of the page.
 
-    Pipeline (F2 + F5 updated):
+    Pipeline (F2 + F5 + FIX-S updated):
       1. Headings-based sections
       2. Semantic containers (table, dl, ul, ol)
       3. Generic block containers (div, section, article)   ← F2 new
@@ -258,8 +343,10 @@ def extract_date_text(html: str) -> str:
 
     Sections from strategies 1–3 are merged, deduplicated, and re-ordered
     by priority (F5) before being capped at MAX_SMART_TEXT_CHARS.
+    FIX-S1/S2: soup already has strikethrough tags removed and en-dashes
+    normalized by _clean_soup() and _normalize_dashes().
     """
-    soup = _clean_soup(html)
+    soup = _clean_soup(html)  # FIX-S1: strips <s>/<del>/<strike> too
 
     # Collect from all structural strategies
     heading_sections = _extract_by_headings(soup)
@@ -273,6 +360,7 @@ def extract_date_text(html: str) -> str:
     if all_structural:
         result = _prioritize_text(all_structural)
         if result.strip():
+            result = _normalize_dashes(result)  # FIX-S2
             log.info(
                 "  [TextExtractor] Structural strategies yielded %d chars "
                 "(%d sections, priority-ordered).",
@@ -282,6 +370,7 @@ def extract_date_text(html: str) -> str:
 
     # Strategy 4 — context window (when no structural match)
     full_text = soup.get_text(separator="\n", strip=True)
+    full_text = _normalize_dashes(full_text)  # FIX-S2
     full_text = re.sub(r"\n{3,}", "\n\n", full_text)
     result = _extract_by_context_window(full_text)
     if result.strip():
