@@ -1,3 +1,9 @@
+# CHANGES:
+# P4 — _find_date_near_label: added stop_keywords param; scanning stops when a line matches another field's label.
+# P4 — Added _cross_field_dedup() to null logically impossible duplicate dates between fields.
+# P5 — _infer_end_date_from_context: changed guard from start_dt <= cand_dt to start_dt < cand_dt so same-date is discarded.
+# P7 — _find_date_near_label: collects ALL date candidates near a label and returns the latest (most recent) to prefer deadline extensions.
+
 """
 regex_extractor.py
 ==================
@@ -22,6 +28,7 @@ F4 fixes:
 
 import re
 import logging
+from datetime import datetime as _dt
 from dateutil import parser as dateutil_parser
 from config import DATE_KEYS
 
@@ -157,27 +164,56 @@ def _normalize_date(raw: str) -> str | None:
         return None
 
 
-def _find_date_near_label(text: str, label_re: str, lookahead: int = 5) -> str | None:
+def _build_all_label_patterns_except(exclude_key: str) -> list[re.Pattern]:
     """
-    Find the first date that appears on or near a line matching label_re.
+    P4 fix: build compiled regex patterns for ALL fields EXCEPT exclude_key.
+    Used as stop_keywords so _find_date_near_label stops scanning when it
+    crosses into another field's label zone.
+    """
+    patterns = []
+    for key, label_list in _LABEL_PATTERNS.items():
+        if key == exclude_key:
+            continue
+        for lp in label_list:
+            patterns.append(re.compile(lp, re.IGNORECASE))
+    return patterns
+
+
+def _find_date_near_label(
+    text: str,
+    label_re: str,
+    lookahead: int = 5,
+    stop_keywords: list[re.Pattern] | None = None,
+) -> str | None:
+    """
+    Find the date that appears on or near a line matching label_re.
+
+    P4 fix: stop_keywords — if a lookahead line matches another field's label,
+    stop scanning immediately to avoid proximity confusion.
+
+    P7 fix: collects ALL date candidates within the lookahead window (for the
+    same label occurrence) and returns the LATEST one, so deadline extensions
+    that appear below the original are preferred.
 
     F4 fix: lookahead increased from 2 to 5 lines (default).
-    Many conference sites emit the label and the date value in separate
-    <td> or <div> elements that become 3–4 lines apart after text
-    extraction.  The original 2-line limit was too narrow for these cases.
     """
     pattern = re.compile(label_re, re.IGNORECASE)
     lines = text.split("\n")
+    stop_keywords = stop_keywords or []
 
     for i, line in enumerate(lines):
         m = pattern.search(line)
         if not m:
             continue
 
+        candidates: list[str] = []
+
         # Look for a date on the same line, after the label
         date_m = _DATE_RE.search(line[m.end():])
         if date_m:
-            return _normalize_date(date_m.group(0))
+            norm = _normalize_date(date_m.group(0))
+            if norm:
+                candidates.append(norm)
 
         # Look forward up to `lookahead` lines
         for offset in range(1, lookahead + 1):
@@ -187,9 +223,18 @@ def _find_date_near_label(text: str, label_re: str, lookahead: int = 5) -> str |
             # Skip separator/blank lines but count them toward lookahead
             if not candidate_line:
                 continue
+            # P4: stop if this line contains another field's label keyword
+            if any(sk.search(candidate_line) for sk in stop_keywords):
+                break
             date_m = _DATE_RE.search(candidate_line)
             if date_m:
-                return _normalize_date(date_m.group(0))
+                norm = _normalize_date(date_m.group(0))
+                if norm:
+                    candidates.append(norm)
+
+        # P7: return the latest (most recent) date to prefer extensions
+        if candidates:
+            return max(candidates)
 
     return None
 
@@ -275,12 +320,15 @@ def _infer_end_date_from_context(text: str, start_date_str: str) -> str | None:
     any range or label pattern, scan the lines near the start-date match
     for a second date that is >= start and within 30 days.
 
+    P5 fix: changed guard from start_dt <= cand_dt to start_dt < cand_dt
+    so that an inferred end date equal to fecha_inicio is discarded.
+
     Conservative guards:
       - Only considers dates within 30 days of start (avoids grabbing a
         submission deadline as end date).
       - Skips lines that match deadline-related keywords.
     """
-    from datetime import datetime as _dt, timedelta
+    from datetime import timedelta
 
     try:
         start_dt = _dt.strptime(start_date_str, "%Y-%m-%d")
@@ -324,10 +372,42 @@ def _infer_end_date_from_context(text: str, start_date_str: str) -> str | None:
             cand_dt = _dt.strptime(candidate, "%Y-%m-%d")
         except ValueError:
             continue
-        if start_dt <= cand_dt <= max_end:
+        # P5 fix: strict inequality — inferred end must be AFTER start
+        if start_dt < cand_dt <= max_end:
             return candidate
 
     return None
+
+
+# ─── Cross-field deduplication (P4 fix) ──────────────────────────────
+
+# Logically impossible pairs: if these two fields share the exact same date,
+# the second in the tuple is considered less reliable and gets nulled.
+_IMPOSSIBLE_DUPES = [
+    ("envio_trabajo", "notificacion_aceptacion"),  # submission can't == acceptance
+    ("notificacion_aceptacion", "inscripcion"),     # acceptance can't == registration
+    ("inscripcion", "fecha_fin"),                   # registration can't == conf end
+    ("inscripcion", "fecha_inicio"),                # registration can't == conf start
+    ("envio_trabajo", "inscripcion"),               # submission can't == registration
+]
+
+
+def _cross_field_dedup(results: dict) -> dict:
+    """
+    P4 fix: after extracting all fields, check for logically impossible
+    duplicate dates between different fields. Null the less reliable one.
+    """
+    for field_a, field_b in _IMPOSSIBLE_DUPES:
+        val_a = results.get(field_a)
+        val_b = results.get(field_b)
+        if val_a and val_b and val_a == val_b:
+            log.warning(
+                "  [RegexExtractor] Duplicate date %s shared by %s and %s "
+                "— nullifying %s (less reliable).",
+                val_a, field_a, field_b, field_b,
+            )
+            results[field_b] = None
+    return results
 
 
 # ─── Public API ──────────────────────────────────────────────────────
@@ -362,16 +442,18 @@ def extract_with_regex(text: str) -> tuple[dict, float]:
 
     # ── conference start (label-based fallback) ──
     if not results["fecha_inicio"]:
+        stop_kw = _build_all_label_patterns_except("fecha_inicio")
         for lp in _LABEL_PATTERNS["fecha_inicio"]:
-            val = _find_date_near_label(text, lp)
+            val = _find_date_near_label(text, lp, stop_keywords=stop_kw)
             if val:
                 results["fecha_inicio"] = val
                 break
 
     # ── conference end (label-based, F4 new) ──
     if not results["fecha_fin"]:
+        stop_kw = _build_all_label_patterns_except("fecha_fin")
         for lp in _LABEL_PATTERNS["fecha_fin"]:
-            val = _find_date_near_label(text, lp)
+            val = _find_date_near_label(text, lp, stop_keywords=stop_kw)
             if val:
                 results["fecha_fin"] = val
                 break
@@ -383,13 +465,17 @@ def extract_with_regex(text: str) -> tuple[dict, float]:
             results["fecha_fin"] = inferred
             log.info("  [RegexExtractor] Inferred fecha_fin=%s from context.", inferred)
 
-    # ── other fields ──
+    # ── other fields (P4: pass stop_keywords to avoid proximity confusion) ──
     for key in ["envio_trabajo", "notificacion_aceptacion", "inscripcion"]:
+        stop_kw = _build_all_label_patterns_except(key)
         for lp in _LABEL_PATTERNS.get(key, []):
-            val = _find_date_near_label(text, lp)
+            val = _find_date_near_label(text, lp, stop_keywords=stop_kw)
             if val:
                 results[key] = val
                 break
+
+    # ── P4: cross-field deduplication ──
+    results = _cross_field_dedup(results)
 
     # ── confidence ──
     found = sum(1 for v in results.values() if v is not None)

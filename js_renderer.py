@@ -1,3 +1,7 @@
+# CHANGES:
+# P2 — Added _KNOWN_JS_DOMAINS set (gjem.press, worldcist.org) and url parameter to is_js_rendered_page().
+#       Domain check fires immediately for known JS sites, bypassing heuristic.
+
 """
 js_renderer.py
 ==============
@@ -13,9 +17,18 @@ Install once:
 """
 
 import logging
+from urllib.parse import urlparse
 from config import REQUEST_TIMEOUT
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Known JS-rendered domains — bypass heuristic, always render with JS
+# ---------------------------------------------------------------------------
+_KNOWN_JS_DOMAINS = {
+    "gjem.press",      # eeeu25.gjem.press, seeu2026.gjem.press — SPA sites
+    "worldcist.org",   # worldcist.org — JS-rendered SPA
+}
 
 # ---------------------------------------------------------------------------
 # Detection: is this HTML "thin" enough to warrant a JS retry?
@@ -27,16 +40,29 @@ log = logging.getLogger(__name__)
 _THIN_HTML_THRESHOLD = 400
 
 
-def is_js_rendered_page(html: str, date_text: str) -> bool:
+def is_js_rendered_page(html: str, date_text: str, url: str = "") -> bool:
     """
     Heuristic: returns True if the page is almost certainly JS-rendered and
     the static download missed the real content.
 
     Checks:
+      0. (P2 new) The URL's domain matches a known JS-rendered domain.
       1. The smart-extracted date text is shorter than the threshold.
       2. The raw HTML contains a JS framework fingerprint.
     Either condition alone is treated as a likely JS page.
     """
+    # P2: check known JS domains first
+    if url:
+        try:
+            domain = urlparse(url).netloc.lower()
+            # Match exact domain or parent domain (e.g. eeeu25.gjem.press → gjem.press)
+            for known in _KNOWN_JS_DOMAINS:
+                if domain == known or domain.endswith("." + known):
+                    log.info("  [JSRenderer] Known JS domain: %s", domain)
+                    return True
+        except Exception:
+            pass
+
     if len(date_text.strip()) < _THIN_HTML_THRESHOLD:
         return True
 
