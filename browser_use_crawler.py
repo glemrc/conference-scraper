@@ -151,6 +151,41 @@ def _extract_structured_elements() -> str:
     return _run_bu(["eval", js], timeout=10)
 
 
+_COMMON_DATE_PATHS = [
+    "/dates",
+    "/important-dates",
+    "/key-dates",
+    "/cfp",
+    "/call-for-papers",
+    "/submission",
+    "/deadlines",
+    "/registration",
+]
+
+
+def _probe_common_paths(base_url: str) -> Optional[str]:
+    """
+    BU-R1: Try appending common date-related paths to the base URL.
+    Returns the first path's HTML that contains date-like text, or None.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(base_url)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+
+    for path in _COMMON_DATE_PATHS:
+        candidate = root + path
+        log.info("  [BrowserUse] BU-R1 probing: %s", candidate)
+        out = _run_bu(["open", candidate], timeout=15)
+        time.sleep(_WAIT_AFTER_OPEN)
+        if "error" in out.lower():
+            continue
+        html = _get_page_html()
+        if html.strip() and _DATE_PAGE_KEYWORDS.search(html):
+            log.info("  [BrowserUse] BU-R1 found date content at: %s", candidate)
+            return html
+    return None
+
+
 def _close_session() -> None:
     """Close the browser-use session cleanly."""
     _run_bu(["close"], timeout=8)
@@ -193,7 +228,18 @@ def navigate_and_extract(url: str) -> Optional[str]:
             _click_index(date_idx)
             log.info("  [BrowserUse] Clicked date link index %d — collecting text.", date_idx)
         else:
-            log.info("  [BrowserUse] No date-specific link found — extracting home page.")
+            # BU-R1: try common URL paths before falling back to home page
+            log.info("  [BrowserUse] No date link found — probing common paths (BU-R1).")
+            probe_html = _probe_common_paths(url)
+            if probe_html:
+                structured = _extract_structured_elements()
+                if structured.strip():
+                    probe_html += "\n--- STRUCTURED ---\n" + structured
+                date_text = extract_date_text(probe_html)
+                if date_text.strip():
+                    log.info("  [BrowserUse] BU-R1 extracted %d chars.", len(date_text))
+                    return date_text[:_MAX_BROWSER_TEXT]
+            log.info("  [BrowserUse] No path hit — extracting home page.")
 
         # 4. Collect rendered HTML (with scrolling)
         rendered_html = _scroll_and_collect()
