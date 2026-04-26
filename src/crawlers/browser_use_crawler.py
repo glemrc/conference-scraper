@@ -204,7 +204,7 @@ def navigate_and_extract(url: str) -> Optional[str]:
     str  — date-relevant text extracted from the page/sub-page, or
     None — if browser-use is unavailable or no content was found.
     """
-    from text_extractor import extract_date_text  # lazy import to avoid circular dep
+    from extractors.text_extractor import extract_date_text  # lazy import to avoid circular dep
 
     if not _is_available():
         log.info("  [BrowserUse] CLI not available — skipping browser fallback.")

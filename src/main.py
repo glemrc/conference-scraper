@@ -77,24 +77,25 @@ from config import (
     DATE_KEYS, COLUMN_LABELS, HTTP_HEADERS,
     MIN_DATE_PATTERNS_FOR_LLM,
 )
-from cache_manager import CacheManager
-from text_extractor import extract_date_text, extract_full_text, extract_conference_name
-from regex_extractor import extract_with_regex
-from change_detector import (
+from utils.cache_manager import CacheManager
+from extractors.text_extractor import extract_date_text, extract_full_text, extract_conference_name
+from extractors.regex_extractor import extract_with_regex
+from extractors.topic_extractor import extract_topics
+from utils.change_detector import (
     detect_changes, load_db_dates, ChangeReport,
 )
-from shallow_crawler import find_date_links, fetch_supplementary_text, field_aware_crawl_needed
+from crawlers.shallow_crawler import find_date_links, fetch_supplementary_text, field_aware_crawl_needed, fetch_subpage_topics
 
 # FIX-BU: browser_use_crawler is optional — degrades gracefully if not installed
 try:
-    from browser_use_crawler import extract_via_browser_use
+    from crawlers.browser_use_crawler import extract_via_browser_use
     _BROWSER_USE_AVAILABLE = True
 except ImportError:
     _BROWSER_USE_AVAILABLE = False
 
 # F1: JS renderer (optional — gracefully absent if playwright not installed)
 try:
-    from js_renderer import is_js_rendered_page, render_with_js
+    from crawlers.js_renderer import is_js_rendered_page, render_with_js
     _JS_RENDERER_AVAILABLE = True
 except ImportError:
     _JS_RENDERER_AVAILABLE = False
@@ -145,7 +146,6 @@ URLS_FIJAS = [
     "https://scrs.in/conference/icdsa2026",
     "https://www.icet.org",
     "https://scrs.in/conference/aic2026",
-    "https://ieee-uemcon.org",
     "https://www.scrs.in/conference/ceee2026",
     "https://icacit.org.pe/symposium/",
     "https://icdici.com/2026/",
@@ -160,7 +160,6 @@ URLS_FIJAS = [
     "https://scrs.in/conference/iti2026",
     "https://scrs.in/conference/scis2026"
 ]
-
 # ═════════════════════════════════════════════
 #  URL LOADING
 # ═════════════════════════════════════════════
@@ -253,7 +252,23 @@ def _static_download(url: str) -> str | None:
             log.error("  Connection error: %s", url)
             return None
     except requests.exceptions.HTTPError as e:
-        log.error("  HTTP %s: %s", e.response.status_code, url)
+        status = e.response.status_code
+        # Retry 403/406 with a relaxed Accept header (some hosts, e.g. scrs.in,
+        # reject the default Accept and return 406).
+        if status in (403, 406):
+            log.warning("  HTTP %d on %s — retrying with relaxed headers...", status, url)
+            try:
+                relaxed = dict(HTTP_HEADERS)
+                relaxed["Accept"] = "*/*"
+                relaxed["Referer"] = "https://www.google.com/"
+                resp = requests.get(url, headers=relaxed, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                log.info("  HTTP %d retry succeeded for %s", status, url)
+                return resp.text
+            except Exception as retry_exc:
+                log.error("  HTTP %d retry failed for %s: %s", status, url, retry_exc)
+                return None
+        log.error("  HTTP %s: %s", status, url)
         return None
     except requests.exceptions.RequestException as e:
         log.error("  Network error (%s): %s", type(e).__name__, url)
@@ -293,6 +308,12 @@ def descargar_html(url: str) -> tuple[str | None, bool]:
     """
     html = _static_download(url)
     if html is None:
+        # Static failed entirely (bot block, 4xx, etc.) — try JS render as last resort
+        if _JS_RENDERER_AVAILABLE:
+            log.info("  [F1] Static download failed — attempting JS render fallback.")
+            js_html = render_with_js(url)
+            if js_html:
+                return js_html, True
         return None, False
 
     if not _JS_RENDERER_AVAILABLE:
@@ -300,7 +321,7 @@ def descargar_html(url: str) -> tuple[str | None, bool]:
 
     # Quick pre-check: extract date text from the static HTML to test quality
     try:
-        from text_extractor import extract_date_text as _edt
+        from extractors.text_extractor import extract_date_text as _edt
         preview_text = _edt(html)
     except Exception:
         preview_text = ""
@@ -495,6 +516,77 @@ def _parse_llm_json(raw: str | None) -> dict:
         result["temas"] = []
 
     return result
+
+
+_TOPICS_PROMPT = """\
+You are extracting the list of topics / tracks / themes / areas of interest \
+of an academic conference from the page text below.
+
+RULES:
+- Output ONLY valid JSON in the exact form: {{"temas": ["topic1", "topic2", ...]}}
+- Each item is a short topic phrase (2-10 words). NO sentences, NO descriptions.
+- DO NOT include: dates, deadlines, committee/chair names, university/institution names,
+  registration info, navigation labels (Home, Contact, Venue, Awards, Program, etc.),
+  paper titles, sponsor names, certificates, or any boilerplate.
+- If the page has NO clear topic list, return {{"temas": []}}.
+- Maximum 30 topics. Deduplicate.
+
+PAGE TEXT:
+{text}"""
+
+
+def llm_extract_topics(html_text: str) -> list[str]:
+    """Last-resort fallback: ask the LLM for the conference topics.
+
+    Called only when every HTML-based heuristic returned an empty list.
+    Returns [] on any error so the pipeline continues unchanged.
+    """
+    if not html_text or not html_text.strip():
+        return []
+
+    snippet = html_text[:8000]
+    prompt = _TOPICS_PROMPT.format(text=snippet)
+    try:
+        raw = _call_llm(prompt)
+    except Exception as exc:
+        log.warning("  [TopicLLM] Call failed: %s", exc)
+        return []
+    if not raw:
+        return []
+
+    # Reuse the JSON repair / extract logic from _parse_llm_json
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+    json_str = match.group(1).strip() if match else raw.strip()
+    obj_match = re.search(r"\{[\s\S]*\}", json_str)
+    if not obj_match:
+        return []
+    json_str = obj_match.group(0)
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        try:
+            data = json.loads(_repair_truncated_json(json_str))
+        except json.JSONDecodeError:
+            return []
+
+    temas = data.get("temas", [])
+    if isinstance(temas, str):
+        temas = [t.strip() for t in temas.split(",")]
+    if not isinstance(temas, list):
+        return []
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for t in temas:
+        s = str(t).strip().rstrip(".;:")
+        if not s or len(s) < 5 or len(s) > 200:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(s)
+    return cleaned[:30]
 
 
 def llm_full_extraction(text: str) -> dict:
@@ -693,6 +785,7 @@ def procesar_url(
     url: str,
     cache: CacheManager,
     db_dates: dict[str, dict],
+    extraction_mode: str = "all"
 ) -> tuple[dict, list, str]:
     """
     Full pipeline for one URL.
@@ -714,7 +807,28 @@ def procesar_url(
         return {"conference_name": None, "url": url, **empty, "notas": "", "fields_found": "0/5"}, [], "error"
 
     # Extract conference name from static HTML (title / h1 / h2)
-    conference_name = extract_conference_name(html)
+    conference_name = extract_conference_name(html, url=url)
+
+    # ── Step 1.5: Extract topics from HTML (regex-based) ──
+    html_topics = []
+    if extraction_mode in ("all", "topics_only"):
+        html_topics = extract_topics(html)
+        if html_topics:
+            log.info("  [TopicExtractor] Found %d topics from HTML.", len(html_topics))
+
+    if extraction_mode == "topics_only":
+        if not html_topics:
+            topic_links = find_date_links(html, url)
+            if topic_links:
+                html_topics = fetch_subpage_topics(topic_links)
+                if html_topics:
+                    log.info("  [TopicCrawl] Found %d topics from sub-pages.", len(html_topics))
+        dates = dict(empty)
+        dates["temas"] = html_topics or []
+        dates["notas"] = "Extraction mode: topics_only"
+        
+        # Don't cache text, but return immediately to skip LLM & regex
+        return {"conference_name": conference_name, "url": url, **dates, "fields_found": "0/5"}, [], "topics_only"
 
     js_prefix = "js+" if used_js else ""
 
@@ -731,7 +845,7 @@ def procesar_url(
 
     # ── Step 2.5: Count date hits for later decisions ──
     crawl_used = False
-    from text_extractor import _DATE_PATTERN  # reuse existing regex
+    from extractors.text_extractor import _DATE_PATTERN  # reuse existing regex
     date_hits = len(_DATE_PATTERN.findall(date_text))
 
     # ── P9: Detect image-content pages ──
@@ -739,7 +853,7 @@ def procesar_url(
     # → dates are probably embedded in images.
     if date_hits == 0 and len(html) > 200:
         # FIX-P: detect PDF links for manual review
-        from text_extractor import detect_pdf_links
+        from extractors.text_extractor import detect_pdf_links
         pdf_links = detect_pdf_links(html, url)
         notas_parts = ["Dates may be in images — manual review needed"]
         if pdf_links:
@@ -761,7 +875,37 @@ def procesar_url(
         log.info("  ✅ Content unchanged, valid cache — skipping extraction.")
         cached = cache.get_cached_dates(url)
         if cached:
-            cached["temas"] = cache.get_cached_topics(url)
+            # Prefer freshly extracted HTML topics over stale cache
+            cached_topics = cache.get_cached_topics(url)
+            topics = html_topics or cached_topics
+
+            # If still no topics, try sub-page crawl for CFP/topics pages
+            if not topics:
+                topic_links = find_date_links(html, url)
+                if topic_links:
+                    topics = fetch_subpage_topics(topic_links)
+                    if topics:
+                        log.info("  [TopicCrawl] Found %d topics from sub-pages (cache path).", len(topics))
+
+            # Last-resort: LLM topic fallback (cache path)
+            if not topics:
+                try:
+                    full_text = extract_full_text(html)[:8000] if html else ""
+                    fb = llm_extract_topics(full_text or date_text)
+                    if fb:
+                        log.info("  [TopicLLM] Fallback recovered %d topics (cache path).", len(fb))
+                        topics = fb
+                except Exception as exc:
+                    log.warning("  [TopicLLM] Fallback error (cache path): %s", exc)
+
+            cached["temas"] = topics
+            # Persist newly found topics to cache
+            if topics and not cached_topics:
+                cache.update(
+                    url, date_text,
+                    {k: cached.get(k) for k in DATE_KEYS},
+                    topics,
+                )
             cached["notas"] = ""
             filled_cache = sum(1 for k in DATE_KEYS if cached.get(k) is not None)
             return {"conference_name": conference_name, "url": url, **cached, "fields_found": f"{filled_cache}/5"}, [], "cache"
@@ -790,6 +934,15 @@ def procesar_url(
                     # Re-run regex on enriched text
                     regex_dates, confidence = extract_with_regex(date_text)
                     method = f"{js_prefix}regex"
+
+    # ── Step 4.6: Sub-page topic crawl (when main page had no topics) ──
+    if extraction_mode == "all" and not html_topics:
+        topic_links = find_date_links(html, url)  # reuses same link finder (now includes topic keywords)
+        if topic_links:
+            sub_topics = fetch_subpage_topics(topic_links)
+            if sub_topics:
+                html_topics = sub_topics
+                log.info("  [TopicCrawl] Found %d topics from sub-pages.", len(html_topics))
 
     # ── Step 5: LLM decision based on confidence ──
     # P3 gate: skip LLM if page has no date content at all
@@ -888,10 +1041,35 @@ def procesar_url(
         notes_parts.append("Hallucination detected — some fields cleared")
     # FIX-P: attach PDF links for manual review
     if html:
-        from text_extractor import detect_pdf_links
+        from extractors.text_extractor import detect_pdf_links
         pdf_links = detect_pdf_links(html, url)
         if pdf_links:
             notes_parts.append("PDF links for review: " + " ; ".join(pdf_links))
+
+    # ── Step 5.8: Merge topics — prefer HTML extraction over LLM ──
+    if extraction_mode == "dates_only":
+        dates["temas"] = []
+    else:
+        llm_topics = dates.get("temas", [])
+        if html_topics:
+            dates["temas"] = html_topics
+        elif llm_topics:
+            dates["temas"] = llm_topics
+        else:
+            dates["temas"] = []
+
+        # Last-resort fallback: ask the LLM specifically for topics when every
+        # HTML-based strategy + sub-page crawl + date-LLM came back empty.
+        if not dates["temas"]:
+            try:
+                full_text = extract_full_text(html)[:8000] if html else ""
+                fallback_topics = llm_extract_topics(full_text or date_text)
+                if fallback_topics:
+                    log.info("  [TopicLLM] Fallback recovered %d topics.", len(fallback_topics))
+                    dates["temas"] = fallback_topics
+                    method += "+topicllm"
+            except Exception as exc:
+                log.warning("  [TopicLLM] Fallback error: %s", exc)
 
     # ── Step 6: Update cache ──
     # P3: if hallucination was detected, store as invalid so next run retries
@@ -993,14 +1171,10 @@ def write_excel_report(
         log.info("⚠️  Fallback CSV saved: %s", csv_path)
 
 
-# ═════════════════════════════════════════════
-#  MAIN
-# ═════════════════════════════════════════════
-
-def main(fuente_urls: str | None = None):
+def main(fuente_urls: str | None = None, progress_callback=None, stop_event=None, pause_event=None, url_list: list[str] | None = None, auto_export: bool = True, extraction_mode: str = "all"):
     """Load URLs, run the pipeline, and generate the report."""
     start_time = time.time()
-    urls = cargar_urls(fuente_urls)
+    urls = url_list if url_list is not None else cargar_urls(fuente_urls)
     if not urls:
         log.error("No URLs to process.")
         return
@@ -1013,21 +1187,47 @@ def main(fuente_urls: str | None = None):
 
     records = []
     for i, url in enumerate(urls, 1):
+        if stop_event and stop_event.is_set():
+            log.info("  ⏹️ Pipeline stopped by user.")
+            break
+
+        while pause_event and pause_event.is_set():
+            time.sleep(0.5)
+            if stop_event and stop_event.is_set():
+                break
+
         print(f"\n{'─' * 60}")
         print(f"  [{i}/{len(urls)}] {url}")
         print(f"{'─' * 60}")
 
-        record, changes, method = procesar_url(url, cache, db_dates)
+        record, changes, method = procesar_url(url, cache, db_dates, extraction_mode)
         record["extraction_method"] = method
         records.append(record)
         change_report.changes.extend(changes)
         stats[method] = stats.get(method, 0) + 1
+        
+        if progress_callback:
+            progress_callback({
+                "index": i,
+                "total": len(urls),
+                "url": url,
+                "record": record,
+                "method": method,
+                "stats": stats.copy()
+            })
 
         if i < len(urls):
-            time.sleep(DELAY_BETWEEN_REQUESTS)
+            # Check for pause/stop during delay as well
+            delay_left = DELAY_BETWEEN_REQUESTS
+            while delay_left > 0:
+                if stop_event and stop_event.is_set():
+                    break
+                time.sleep(min(0.5, delay_left))
+                delay_left -= 0.5
 
     cache.save()
-    write_excel_report(records, change_report)
+    if records and auto_export:
+        write_excel_report(records, change_report)
 
     # ── Summary ──
     total_cache  = sum(v for k, v in stats.items() if k == "cache")
@@ -1049,7 +1249,7 @@ def main(fuente_urls: str | None = None):
     print(f"  JS rendering used : {total_js}")
     print(f"  Image-content     : {total_img}")
     print(f"  Errors            : {total_errors}")
-    print(f"  LLM calls saved   : {total_cache + total_regex} / {len(records)}")
+    print(f"  LLM calls saved   : {total_cache + total_regex} / {max(1, len(records))}")
     
     total_time = time.time() - start_time
     minutes, seconds = divmod(total_time, 60)
@@ -1073,6 +1273,14 @@ def main(fuente_urls: str | None = None):
     else:
         print("  ✅ No changes detected vs. database.")
     print()
+
+    if progress_callback:
+        progress_callback({
+            "done": True, 
+            "stats": stats.copy(),
+            "records": records,
+            "change_report": change_report
+        })
 
 
 if __name__ == "__main__":

@@ -37,8 +37,8 @@ log = logging.getLogger(__name__)
 # ─── Month name helpers ──────────────────────────────────────────────
 
 _MONTH_NAMES = (
-    r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
-    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+    r"Jan(?:uary)?\.?|Feb(?:ruary)?\.?|Mar(?:ch)?\.?|Apr(?:il)?\.?|May\.?|Jun(?:e)?\.?|"
+    r"Jul(?:y)?\.?|Aug(?:ust)?\.?|Sep(?:tember)?\.?|Oct(?:ober)?\.?|Nov(?:ember)?\.?|Dec(?:ember)?\.?"
 )
 
 _DATE_RE_PARTS = [
@@ -85,6 +85,10 @@ _LABEL_PATTERNS: dict[str, list[str]] = {
         r"(?:author|paper)\s+(?:notification|acceptance)",
         r"acceptance\s+(?:notification|notice|decision)",
         r"review\s+(?:notification|results?|decision)",
+        r"notification\s+to\s+authors?",
+        r"acceptance\s+intimation",
+        r"notification\s+deadline",
+        r"(?:^|[:\s])notification\s*(?::|$)",
         r"notificaci[oó]n\s+de\s+(?:aceptaci[oó]n|resultados)",
     ],
     "inscripcion": [
@@ -102,9 +106,9 @@ _LABEL_PATTERNS: dict[str, list[str]] = {
 _ORD_STRIP = re.compile(r"(\d+)(?:st|nd|rd|th)", re.IGNORECASE)
 
 _RANGE_PATTERNS = [
-    # "5-7 February 2026" / "5th–7th February 2026"
+    # "5-7 February 2026" / "5th–7th February 2026" / "11-13, February 2027"
     re.compile(
-        rf"(\d{{1,2}})(?:st|nd|rd|th)?\s*[\-–—]\s*(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES})[,.\s]+(\d{{4}})",
+        rf"(\d{{1,2}})(?:st|nd|rd|th)?\s*[\-–—]\s*(\d{{1,2}})(?:st|nd|rd|th)?,?\s+({_MONTH_NAMES})[,.\s]+(\d{{4}})",
         re.IGNORECASE,
     ),
     # "February 5-7, 2026"
@@ -142,6 +146,26 @@ _RANGE_PATTERNS = [
         rf"(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES})\s+through\s+(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES})[,.\s]+(\d{{4}})",
         re.IGNORECASE,
     ),
+    # BUG4 new: "February 5 to March 2, 2026" (cross-month, Month Day to Month Day, Year)
+    re.compile(
+        rf"({_MONTH_NAMES})\s+(\d{{1,2}})(?:st|nd|rd|th)?\s+to\s+({_MONTH_NAMES})\s+(\d{{1,2}})(?:st|nd|rd|th)?[,.\s]+(\d{{4}})",
+        re.IGNORECASE,
+    ),
+    # BUG4 new: "February 5 through March 2, 2026"
+    re.compile(
+        rf"({_MONTH_NAMES})\s+(\d{{1,2}})(?:st|nd|rd|th)?\s+through\s+({_MONTH_NAMES})\s+(\d{{1,2}})(?:st|nd|rd|th)?[,.\s]+(\d{{4}})",
+        re.IGNORECASE,
+    ),
+    # new: "October 28, 2026 - October 31, 2026" (year on both full dates, Month-Day-Year)
+    re.compile(
+        rf"({_MONTH_NAMES})\s+(\d{{1,2}})(?:st|nd|rd|th)?[,.\s]+(\d{{4}})\s*[\-–—]\s*({_MONTH_NAMES})\s+(\d{{1,2}})(?:st|nd|rd|th)?[,.\s]+(\d{{4}})",
+        re.IGNORECASE,
+    ),
+    # new: "28 October 2026 - 31 October 2026" (year on both full dates, Day-Month-Year)
+    re.compile(
+        rf"(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES})[,.\s]+(\d{{4}})\s*[\-–—]\s*(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES})[,.\s]+(\d{{4}})",
+        re.IGNORECASE,
+    ),
 ]
 
 
@@ -152,13 +176,19 @@ def _strip_ordinal(s: str) -> str:
     return _ORD_STRIP.sub(r"\1", s)
 
 
+_ISO_DATE_RE = re.compile(r"^\d{4}[/\-]\d{1,2}[/\-]\d{1,2}$")
+
+
 def _normalize_date(raw: str) -> str | None:
     """Parse a raw date string and return YYYY-MM-DD or None."""
     raw = _strip_ordinal(raw.strip().rstrip("."))
     if not raw or raw.lower() in ("none", "null", "n/a", "tbd", ""):
         return None
     try:
-        dt = dateutil_parser.parse(raw, dayfirst=True)
+        # BUG6 fix: ISO dates (YYYY-MM-DD) must NOT use dayfirst to avoid
+        # misinterpreting month/day (e.g. 2026-10-14 → month=14 overflow).
+        is_iso = bool(_ISO_DATE_RE.match(raw))
+        dt = dateutil_parser.parse(raw, dayfirst=not is_iso)
         return dt.strftime("%Y-%m-%d")
     except (ValueError, OverflowError):
         return None
@@ -266,6 +296,15 @@ def _try_date_range(text: str) -> tuple[str | None, str | None]:
             start = _normalize_date(f"{d1} {m1} {year}")
             end   = _normalize_date(f"{d2} {m2} {year}")
             return start, end
+        elif len(groups) == 6:
+            # "Month DD, YYYY - Month DD, YYYY" or "DD Month YYYY - DD Month YYYY"
+            if groups[0].isdigit():
+                d1, m1, y1, d2, m2, y2 = groups
+            else:
+                m1, d1, y1, m2, d2, y2 = groups
+            start = _normalize_date(f"{d1} {m1} {y1}")
+            end   = _normalize_date(f"{d2} {m2} {y2}")
+            return start, end
 
     return None, None
 
@@ -294,6 +333,8 @@ def _try_multiline_range(text: str) -> tuple[str | None, str | None]:
             continue
 
         # Collect up to 6 dates from the next 8 lines
+        # BUG7 fix: allow duplicate dates so single-day conferences (start==end)
+        # are detected correctly.
         found_dates: list[str] = []
         for offset in range(1, 9):
             if i + offset >= len(lines):
@@ -301,7 +342,7 @@ def _try_multiline_range(text: str) -> tuple[str | None, str | None]:
             m = _DATE_RE.search(lines[i + offset])
             if m:
                 norm = _normalize_date(m.group(0))
-                if norm and norm not in found_dates:
+                if norm:
                     found_dates.append(norm)
             if len(found_dates) >= 2:
                 break
@@ -386,8 +427,8 @@ def _infer_end_date_from_context(text: str, start_date_str: str) -> str | None:
 _IMPOSSIBLE_DUPES = [
     ("envio_trabajo", "notificacion_aceptacion"),  # submission can't == acceptance
     ("notificacion_aceptacion", "inscripcion"),     # acceptance can't == registration
-    ("inscripcion", "fecha_fin"),                   # registration can't == conf end
-    ("inscripcion", "fecha_inicio"),                # registration can't == conf start
+    ("fecha_fin", "inscripcion"),                   # registration can't == conf end
+    ("fecha_inicio", "inscripcion"),                # registration can't == conf start
     ("envio_trabajo", "inscripcion"),               # submission can't == registration
 ]
 

@@ -28,7 +28,8 @@ from bs4 import BeautifulSoup
 from config import (
     HTTP_HEADERS, REQUEST_TIMEOUT, MAX_SMART_TEXT_CHARS,
 )
-from text_extractor import extract_date_text
+from extractors.text_extractor import extract_date_text
+from extractors.topic_extractor import extract_topics
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +40,10 @@ _LINK_KEYWORDS = re.compile(
     r"important[.\-_\s]?dates?|deadlines?|call[.\-_\s]?for[.\-_\s]?papers?"
     r"|key[.\-_\s]?dates?|submission|cfp|plazos|fechas"
     r"|notification|program(?:me)?|schedule|registration|brochure"
-    r"|dates[.\-_\s]?importantes|convocatoria",
+    r"|dates[.\-_\s]?importantes|convocatoria"
+    r"|topics?|tracks?|scope|themes?|areas?\s+of\s+interest"
+    r"|track[.\-_\s]?descriptions?|research[.\-_\s]?areas?"
+    r"|mini[.\-_\s]?tracks?|symposia|sessions?[.\-_\s]?topics?",
     re.IGNORECASE,
 )
 
@@ -185,3 +189,23 @@ def fetch_supplementary_text(
         log.info("  [ShallowCrawl] Added %d chars from %s", len(chunk), url)
 
     return "\n--- SUB-PAGE ---\n".join(parts)
+
+
+def fetch_subpage_topics(sub_urls: list[str]) -> list[str]:
+    """Download sub-pages and extract topics from their HTML.
+
+    Used when the main page has no topics — CFP/topics sub-pages often do.
+    """
+    all_topics: list[str] = []
+    for url in sub_urls:
+        try:
+            resp = requests.get(url, headers=HTTP_HEADERS,
+                                timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            topics = extract_topics(resp.text)
+            if topics:
+                log.info("  [ShallowCrawl] Found %d topics from %s", len(topics), url)
+                all_topics.extend(topics)
+        except Exception as exc:
+            log.warning("  [ShallowCrawl] Failed to fetch %s for topics: %s", url, exc)
+    return all_topics

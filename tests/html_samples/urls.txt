@@ -1,0 +1,19 @@
+ICET 2026
+URL_ORIGINAL: https://www.icet.org
+URL_TOPICS: https://www.icet.org/cfp.html
+
+PCCDA 2026
+URL_ORIGINAL: https://scrs.in/conference/pccda2026
+URL_TOPICS: https://scrs.in/conference/pccda2026/page/Camera_Ready_Paper_Submission
+
+SCIS 2026
+URL_ORIGINAL: https://scrs.in/conference/scis2026
+URL_TOPICS: https://scrs.in/conference/scis2026/page/call_for_papers
+
+PACIS 2026
+URL_ORIGINAL: https://pacis2026.aisconferences.org
+URL_TOPICS: https://pacis2026.aisconferences.org/submissions/call-for-papers/
+
+EEEU25
+URL_ORIGINAL: https://eeeu25.gjem.press
+URL_TOPICS: https://eeeu25.gjem.press/#topics

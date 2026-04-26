@@ -50,21 +50,31 @@ _PRIORITY_KEYWORDS = [
 ]
 
 # Regex: matches common date-like patterns (does NOT validate)
+_MONTH_RE = (
+    r"Jan(?:uary)?\.?|Feb(?:ruary)?\.?|Mar(?:ch)?\.?|Apr(?:il)?\.?|May\.?|Jun(?:e)?\.?|"
+    r"Jul(?:y)?\.?|Aug(?:ust)?\.?|Sep(?:tember)?\.?|Oct(?:ober)?\.?|Nov(?:ember)?\.?|Dec(?:ember)?\.?"
+)
+
 _DATE_PATTERN = re.compile(
-    r"""
+    rf"""
     (?:                                            # ── Named month formats ──
-        \d{1,2}\s+                                 # 15 June 2026
-        (?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|
-           Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)
-        [,.\s]+\d{4}
+        \d{{1,2}}(?:st|nd|rd|th)?\s+              # 15 June 2026
+        (?:{_MONTH_RE})
+        [,.\s]+\d{{4}}
     |
-        (?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|
-           Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)
-        \s+\d{1,2}[,.\s]+\d{4}                     # June 15, 2026
+        (?:{_MONTH_RE})                            # June 15, 2026
+        \s+\d{{1,2}}(?:st|nd|rd|th)?
+        (?:\s*[-–—]\s*\d{{1,2}}(?:st|nd|rd|th)?)?  # optional range: June 15-17, 2026
+        [,.\s]+\d{{4}}
+    |
+        \d{{1,2}}(?:st|nd|rd|th)?                  # 15-17 June 2026 (day range)
+        \s*[-–—]\s*\d{{1,2}}(?:st|nd|rd|th)?
+        \s+(?:{_MONTH_RE})
+        [,.\s]+\d{{4}}
     |                                              # ── Numeric formats ──
-        \d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}           # 15/06/2026  or  06-15-26
+        \d{{1,2}}[/\-]\d{{1,2}}[/\-]\d{{2,4}}     # 15/06/2026  or  06-15-26
     |
-        \d{4}[/\-]\d{1,2}[/\-]\d{1,2}             # 2026-06-15
+        \d{{4}}[/\-]\d{{1,2}}[/\-]\d{{1,2}}       # 2026-06-15
     )
     """,
     re.VERBOSE | re.IGNORECASE,
@@ -175,8 +185,9 @@ def _prioritize_text(sections: list[str]) -> str:
     F5 fix: re-order sections so high-priority content appears first,
     then build the output string respecting MAX_SMART_TEXT_CHARS.
 
-    This ensures the "Important Dates" block is never truncated away in
-    favour of lower-relevance content that happened to appear earlier.
+    Priority sections are sorted shortest-first so that a concise
+    "Important Dates" block is never pushed out by a large generic div
+    that also happens to contain a priority keyword somewhere.
     """
     priority: list[str] = []
     normal: list[str] = []
@@ -186,6 +197,8 @@ def _prioritize_text(sections: list[str]) -> str:
         else:
             normal.append(s)
 
+    # Shortest priority sections first — specific date blocks beat large wrappers
+    priority.sort(key=len)
     ordered = priority + normal
     result_parts: list[str] = []
     used = 0
@@ -205,10 +218,18 @@ def _prioritize_text(sections: list[str]) -> str:
 # ─── extraction strategies ──────────────────────────────────────────
 
 def _extract_by_headings(soup: BeautifulSoup) -> list[str]:
-    """Strategy 1: grab content under date-related headings."""
+    """Strategy 1: grab content under date-related headings.
+
+    Two trigger conditions:
+      a) heading text contains a date-section keyword (e.g. 'Important Dates')
+      b) heading text itself IS a date or date range (e.g. '24-26 September 2025,
+         Seoul') — common on Elementor/builder pages where the conference date
+         is placed directly in an <h4> with no surrounding keywords.
+    """
     sections: list[str] = []
     for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
-        if _matches_keyword(heading.get_text()):
+        heading_text = heading.get_text()
+        if _matches_keyword(heading_text) or _has_dates(heading_text):
             section = _collect_section(heading)
             if section.strip() and _has_dates(section):
                 sections.append(section)
@@ -298,13 +319,105 @@ def detect_pdf_links(html: str, base_url: str = "") -> list[str]:
 
 # ─── Conference name extraction ─────────────────────────────────────
 
-_CONF_NAME_RE = re.compile(r"\b([A-Z]{2,8}\s+\d{4})\b")
+# Month names to filter out false positives in conference name extraction
+_MONTH_WORDS = {
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+}
+
+# Noise words that should not be treated as conference acronyms
+_NOISE_WORDS = {
+    "home", "welcome", "the", "call", "download", "about", "contact",
+    "login", "register", "paper", "papers", "submit", "submission",
+    "conference", "symposium", "workshop", "congress", "international",
+    "deadline", "deadlines", "important", "search",
+} | _MONTH_WORDS
+
+# Patterns tried in order — first match wins.
+_CONF_NAME_PATTERNS = [
+    # "ICOAMP 2026" / "LACCEI 2026" — classic ACRONYM YEAR with space
+    re.compile(r"\b([A-Z]{2,10}\s+\d{4})\b"),
+    # "ICOAMP2026" / "ICITAI2026" / "CSOC2026" — ACRONYM glued to YEAR
+    re.compile(r"\b([A-Z]{2,10})(\d{4})\b"),
+    # "PEIS-2026" / "STAI-2026" — ACRONYM-YEAR with hyphen
+    re.compile(r"\b([A-Z]{2,10})\s*[-–]\s*(\d{4})\b"),
+    # "(ICoAMP)" in parentheses — mixed case inside parens
+    re.compile(r"\(([A-Za-z]{3,12})\)"),
+    # "CoMeSySo2026" / "WorldCist'26" — mixed-case acronym + year
+    re.compile(r"\b([A-Za-z]{3,14}?)[\s'']?(\d{2,4})\b"),
+]
 
 
-def extract_conference_name(html: str) -> str | None:
+def _format_conf_name(m: re.Match) -> str:
+    """Normalize match groups into 'ACRONYM YEAR' format."""
+    groups = m.groups()
+    if len(groups) == 1:
+        # Single group — could be "ICOAMP 2026" or "(ICoAMP)"
+        text = groups[0].strip()
+        if " " in text:
+            return text
+        # Parenthesized acronym without year
+        return text.upper()
+    acronym, year = groups[0], groups[1]
+    # Normalize short year: '26' -> '2026'
+    if len(year) == 2:
+        year = "20" + year
+    return f"{acronym.upper()} {year}"
+
+
+def _extract_acronym_from_url(url: str) -> str | None:
+    """Last-resort: extract acronym from URL domain or path segments like
+    /conference/icitai2026, /peis2026, acdsa.org/2026/, or icet.org."""
+    import re as _re
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+
+    # Pattern 1: path segment with acronym+year glued (e.g. /icitai2026)
+    m = _re.search(r"/([a-zA-Z]{2,12})(\d{4})(?:[/\?#]|$)", parsed.path)
+    if m:
+        acronym = m.group(1).upper()
+        year = m.group(2)
+        if acronym.lower() not in _NOISE_WORDS:
+            return f"{acronym} {year}"
+
+    # Pattern 2: path has /acronym/year/ separately (e.g. /acdsa.org/2026/)
+    m = _re.search(r"/([a-zA-Z]{2,12})/(\d{4})(?:[/\?#]|$)", url)
+    if m:
+        acronym = m.group(1).upper()
+        year = m.group(2)
+        if acronym.lower() not in _NOISE_WORDS:
+            return f"{acronym} {year}"
+
+    # Pattern 3: domain-based (e.g. acdsa.org, icet.org, icacit.org.pe)
+    domain = parsed.hostname or ""
+    m = _re.match(r"(?:www\.)?([a-zA-Z]{2,12})\.", domain)
+    if m:
+        acronym = m.group(1).upper()
+        if acronym.lower() not in _NOISE_WORDS and len(acronym) >= 3:
+            # Try to find a year from the path
+            year_m = _re.search(r"(\d{4})", parsed.path)
+            if year_m:
+                return f"{acronym} {year_m.group(1)}"
+            return acronym
+
+    return None
+
+
+def extract_conference_name(html: str, url: str = "") -> str | None:
     """
     Extract conference name in 'ACRONYM YEAR' format (e.g. 'ICOAMP 2026')
-    from the page <title>, <h1>, and <h2> tags.
+    from the page <title>, <h1>, <h2>, and meta tags.
+
+    Handles multiple real-world formats:
+      - "ICOAMP 2026" (space-separated)
+      - "ICITAI2026" (glued)
+      - "PEIS-2026" (hyphenated)
+      - "(ICoAMP)" (parenthesized in body text)
+      - "CoMeSySo2026" / "WorldCist'26" (mixed-case + short year)
+
+    Falls back to extracting acronym from URL path if nothing found in HTML.
 
     Returns the first match found, or None.
     """
@@ -322,10 +435,29 @@ def extract_conference_name(html: str) -> str | None:
             if text:
                 candidates.append(text)
 
-    for candidate in candidates:
-        m = _CONF_NAME_RE.search(candidate)
-        if m:
-            return m.group(1)
+    # Also check <meta property="og:title"> and <meta name="title">
+    for meta in soup.find_all("meta"):
+        prop = meta.get("property", "") or meta.get("name", "")
+        if prop.lower() in ("og:title", "title", "og:site_name"):
+            content = meta.get("content", "").strip()
+            if content:
+                candidates.append(content)
+
+    # Try each pattern in priority order across all candidates
+    for pattern in _CONF_NAME_PATTERNS:
+        for candidate in candidates:
+            m = pattern.search(candidate)
+            if m:
+                name = _format_conf_name(m)
+                # Filter out noise
+                acronym = name.split()[0]
+                if acronym.lower() in _NOISE_WORDS:
+                    continue
+                return name
+
+    # Fallback: extract from URL
+    if url:
+        return _extract_acronym_from_url(url)
 
     return None
 

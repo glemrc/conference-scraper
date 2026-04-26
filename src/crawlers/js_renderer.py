@@ -26,8 +26,10 @@ log = logging.getLogger(__name__)
 # Known JS-rendered domains — bypass heuristic, always render with JS
 # ---------------------------------------------------------------------------
 _KNOWN_JS_DOMAINS = {
-    "gjem.press",      # eeeu25.gjem.press, seeu2026.gjem.press — SPA sites
-    "worldcist.org",   # worldcist.org — JS-rendered SPA
+    "gjem.press",        # eeeu25.gjem.press, seeu2026.gjem.press — SPA sites
+    "worldcist.org",     # worldcist.org — JS-rendered SPA
+    "theioes.org",       # ijcaci2026, aita2026, air2026 — content rendered client-side
+    "openpublish.eu",    # csoc, comesyso — accordion content hidden behind JS toggles
 }
 
 # ---------------------------------------------------------------------------

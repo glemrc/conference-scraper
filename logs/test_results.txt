@@ -1,0 +1,7 @@
+FAIL text_extractor.detect_pdf_links: No module named 'bs4'
+FAIL text_extractor._normalize_dashes: No module named 'bs4'
+FAIL shallow_crawler.field_aware_crawl_needed: No module named 'requests'
+OK   browser_use_crawler imports
+FAIL scraper_v2 top-level imports: No module named 'requests'
+
+FAILED: ["FAIL text_extractor.detect_pdf_links: No module named 'bs4'", "FAIL text_extractor._normalize_dashes: No module named 'bs4'", "FAIL shallow_crawler.field_aware_crawl_needed: No module named 'requests'", "FAIL scraper_v2 top-level imports: No module named 'requests'"]

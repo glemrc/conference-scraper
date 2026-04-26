@@ -14,10 +14,12 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 # Paths
 # ─────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
-CACHE_FILE = BASE_DIR / "scraper_cache.json"
-OUTPUT_FILE = BASE_DIR / "fechas_conferencias_v3.xlsx"
-DB_FILE = BASE_DIR / "Proceeding BD.xlsx"  # existing database
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+
+CACHE_FILE = DATA_DIR / "cache" / "scraper_cache.json"
+OUTPUT_FILE = DATA_DIR / "output" / "fechas_conferencias_comesyso.xlsx"
+DB_FILE = DATA_DIR / "input" / "Proceeding BD.xlsx"  # existing database
 
 # ─────────────────────────────────────────────
 # Groq API
@@ -75,6 +77,10 @@ HTTP_HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
 }

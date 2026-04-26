@@ -1,0 +1,12 @@
+https://icacit.org.pe/symposium/2025/ - No tomo ni una fecha
+https://eeeu25.gjem.press - No tomo la fecha de inicio ni fin de la conferencia, además tomo incorrectamente el submission deadline y el registration deadline
+https://worldcist.org - No tomo ni una fecha
+https://seeu2026.gjem.press Tomo las fechas, pero en desorden. Además la fecha de inicio y fin de la conferencia son incorrectas
+https://laccei.org/laccei2026/call-for-papers/ Tomo las fechas incorrectas (aunque en este link en especial existen demasiadas fechas y han habido fechas aplazadas)
+https://icoamp.com/index.htm No tomo ni una fecha, en esta página la fecha de inicio y fin de la conferencia puede ser extraida, pero en el caso de los otros deadlines es una imagen
+https://www.gkciet.ac.in/peis2026 No tomo ni una fecha a pesar de que si están, seria cuestión de mejorar los metodos de extracción
+https://stai2026.estindiafoundation.org/ - No tomo ni una fecha a pesar de que es una página con formato de la india (la más fácil) y se me hace raro porque con otras páginas .in no tiene problemas
+https://icepr.org - No tomo correctamente la fecha de inicio y fin de la conferencia
+https://www.icet.org Tomo incorrectamente el submission deadline y me parece curioso que haya hecho crawling cuando todo estaba en el mismo link
+https://icacit.org.pe/symposium/ tomo incorrectamente los deadlines submission, acceptance notification y registrarion (desorden)
+https://icdici.com/2026/ tiene fechas en la tabla, pero ni una es correcta. Sospecho que el llm tiro fechas cualquieras al no encontrar y tambien menciona que se hizo crawling, aunque todo estaba estaba en la misma página
